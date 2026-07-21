@@ -12,6 +12,12 @@ from helpers import (
 )
 
 
+def add_channel_dimension(images):
+    if images.ndim == 3:
+        return np.expand_dims(images, axis=1)
+    return images
+
+
 class Dataset(TorchDataset):
     def __init__(
         self,
@@ -163,16 +169,30 @@ class DataProcessor:
 
     """
     def __init__(self, train_x, train_y, valid_x, valid_y, test_x, metadata, clock):
-        self.train_x = train_x
+        self.train_x = add_channel_dimension(train_x)
         self.train_y = train_y
-        self.valid_x = valid_x
+        self.valid_x = add_channel_dimension(valid_x)
         self.valid_y = valid_y
-        self.test_x = test_x
+        self.test_x = add_channel_dimension(test_x)
         self.metadata = metadata
         self.clock = clock
 
         self.seed = 42
         self.metadata["seed"] = self.seed
+
+        self.augmentations = [
+            AugmentationType.TRANSLATION,
+            AugmentationType.PIXEL_NOISE,
+            AugmentationType.OCCLUSION,
+        ]
+        self.augmentation_probability = 0.5
+        self.augmentation_value_range = None
+
+        if AugmentationType.RGB in self.augmentations:
+            self.augmentation_value_range = (
+                float(np.min(self.train_x)),
+                float(np.max(self.train_x)),
+            )
 
     """
     ====================================================================================================================
@@ -192,19 +212,6 @@ class DataProcessor:
         std = np.std(self.train_x, axis=(0, 2, 3), dtype=np.float64).astype(np.float32)
         std = np.maximum(std, np.finfo(np.float32).eps)
 
-        augmentations = [
-            AugmentationType.TRANSLATION,
-            AugmentationType.PIXEL_NOISE,
-            AugmentationType.OCCLUSION,
-        ]
-        augmentation_probability = 0.5
-        augmentation_value_range = None
-        if AugmentationType.RGB in augmentations:
-            augmentation_value_range = (
-                float(np.min(self.train_x)),
-                float(np.max(self.train_x)),
-            )
-
         augmentation_generator = torch.Generator()
         augmentation_generator.manual_seed(self.seed + 1)
 
@@ -213,9 +220,9 @@ class DataProcessor:
             self.train_y,
             mean,
             std,
-            augmentations=augmentations,
-            augmentation_probability=augmentation_probability,
-            augmentation_value_range=augmentation_value_range,
+            augmentations=self.augmentations,
+            augmentation_probability=self.augmentation_probability,
+            augmentation_value_range=self.augmentation_value_range,
             generator=augmentation_generator,
         )
 
