@@ -131,7 +131,7 @@ def fail_dataset(metadata):
     with open("predictions/{}_stats.pkl".format(metadata['codename']), "wb") as f:
         pkl.dump(run_data, f)
 
-def is_out_of_time(clock:Clock, metadata, grace_time:bool):
+def is_out_of_time(clock:Clock, metadata, grace_time:bool=False):
     if clock.check() < 0:
         if grace_time:
             if clock.check() > -60:
