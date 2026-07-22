@@ -52,6 +52,7 @@ class NAS:
         """
         Configure search space parameters based on dataset metadata.
         Larger/more complex datasets get wider/deeper networks.
+        Model size is scaled to dataset complexity to avoid overfitting.
         """
         n_datapoints = self.input_shape[0]
         spatial_size = self.img_height * self.img_width
@@ -64,32 +65,39 @@ class NAS:
         else:
             self.n_nodes = 5
 
-        # Number of cells: adapted to image size
-        if spatial_size <= 256:  # very small images (e.g., 16x16 or smaller)
+        # (B) Scale model size to dataset complexity
+        # For simple tasks (few classes, tiny images), use smaller models
+        if self.num_classes <= 10 and spatial_size <= 512:
+            # Very simple tasks (e.g., Gutenberg: 6 classes, 27x18)
+            self.cell_counts = [2, 3]
+            self.init_channels_options = [16, 24]
+        elif spatial_size <= 256:  # very small images (e.g., 16x16 or smaller)
             self.cell_counts = [2, 3, 4]
+            self.init_channels_options = [16, 24, 32]
         elif spatial_size <= 1024:  # small images (e.g., 32x32)
             self.cell_counts = [3, 4, 5]
-        else:  # larger images
-            self.cell_counts = [4, 5, 6]
-
-        # Initial channel widths: adapted to input channels and complexity
-        if spatial_size <= 256:
-            self.init_channels_options = [16, 24, 32]
-        elif spatial_size <= 1024:
             self.init_channels_options = [24, 32, 48]
-        else:
+        else:  # larger images (e.g., 64x64)
+            self.cell_counts = [4, 5, 6]
             self.init_channels_options = [32, 48, 64]
 
-        # Budget-aware: how many candidates to evaluate
-        # More time remaining -> more candidates
+        # (A) Ideal param count heuristic — used for penalty in scoring
+        self.ideal_params = self.num_classes * 50_000  # ~50K params per class
+
+        # (C) Budget-aware: how many candidates to evaluate
+        # Larger images need more exploration
         if self.time_remaining > 18000:  # > 5 hours
-            self.n_candidates = 60
+            self.n_candidates = 80
         elif self.time_remaining > 7200:  # > 2 hours
-            self.n_candidates = 40
+            self.n_candidates = 50
         elif self.time_remaining > 3600:  # > 1 hour
-            self.n_candidates = 30
+            base = 30
+            # More candidates for larger images (need more exploration)
+            if spatial_size > 1024:
+                base = 40
+            self.n_candidates = base
         else:
-            self.n_candidates = 20
+            self.n_candidates = 25
 
     """
     ====================================================================================================================
@@ -138,9 +146,10 @@ class NAS:
             except Exception:
                 continue
 
-            # Compute parameter count — skip if too large (> 10M params)
+            # Compute parameter count — skip if too large relative to task complexity
             param_count = compute_param_count(model)
-            if param_count > 10_000_000:
+            max_params = min(10_000_000, self.ideal_params * 20)  # adaptive cap
+            if param_count > max_params:
                 continue
 
             # Compute NASWOT score
@@ -181,6 +190,10 @@ class NAS:
             c['combined_score'] = compute_combined_score(
                 naswot_scores[i], synflow_scores[i], naswot_weight=0.5
             )
+
+            # (A) Param count penalty — penalize overly large models for simple tasks
+            param_penalty = max(0, (c['params'] - self.ideal_params * 3) / (self.ideal_params * 10))
+            c['combined_score'] -= param_penalty
 
         # Sort by combined score (descending)
         candidates.sort(key=lambda c: c['combined_score'], reverse=True)

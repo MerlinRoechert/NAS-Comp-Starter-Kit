@@ -30,9 +30,18 @@ class Trainer:
         self.learning_rate = min(0.2, max(0.01, 0.05 * batch_size / 128.0))
         self.max_epochs = self._epoch_cap()
         self.criterion = self._make_criterion()
+
+        # (E) Stronger weight decay for smaller/simpler datasets to reduce overfitting
+        n_samples = metadata.get('input_shape', [50000])[0]
+        num_classes = metadata.get('num_classes', 10)
+        if num_classes <= 10 and n_samples >= 30_000:
+            wd = 1e-3  # stronger regularization for simple tasks prone to overfitting
+        else:
+            wd = 5e-4
+
         self.optimizer = torch.optim.SGD(
             self.model.parameters(), lr=self.learning_rate, momentum=0.9,
-            nesterov=True, weight_decay=5e-4,
+            nesterov=True, weight_decay=wd,
         )
 
         self._use_amp = self.device.type == "cuda" and torch.cuda.is_available()
@@ -52,7 +61,7 @@ class Trainer:
         n = len(getattr(self.train_dataloader, "dataset", ()))
         # Small datasets benefit from more optimizer updates. Large datasets get
         # fewer epochs and are governed mainly by the wall-clock check.
-        size_cap = 120 if n < 5_000 else (80 if n < 25_000 else 50)
+        size_cap = 150 if n < 5_000 else (120 if n < 25_000 else 100)
         time_cap = max(1, int(remaining / 30.0))
         return min(size_cap, time_cap)
 
@@ -72,8 +81,9 @@ class Trainer:
         return min(300.0, max(30.0, 0.10 * max(0.0, initial)))
 
     def _set_learning_rate(self, step, total_steps):
-        """Five-percent warm-up followed by per-step cosine decay."""
-        warmup = max(1, int(0.05 * total_steps))
+        """Ten-percent warm-up followed by per-step cosine decay.
+        Longer warmup helps with initially unstable gradients on novel datasets."""
+        warmup = max(1, int(0.10 * total_steps))
         if step < warmup:
             factor = float(step + 1) / warmup
         else:
