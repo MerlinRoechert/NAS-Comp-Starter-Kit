@@ -51,11 +51,15 @@ class NAS:
     def _configure_search_space(self):
         """
         Configure search space parameters based on dataset metadata.
-        Larger/more complex datasets get wider/deeper networks.
-        Model size is scaled to dataset complexity to avoid overfitting.
+        Key insight: only constrain model size for truly simple tasks that are
+        prone to overfitting. For complex tasks, allow large models.
         """
         n_datapoints = self.input_shape[0]
         spatial_size = self.img_height * self.img_width
+
+        # Estimate dataset complexity
+        self.is_simple_task = (self.num_classes <= 10 and spatial_size <= 512)
+        self.is_large_spatial = (spatial_size > 1024)
 
         # Nodes per cell: 3-5 depending on complexity
         if self.num_classes <= 10 and spatial_size <= 1024:
@@ -65,37 +69,29 @@ class NAS:
         else:
             self.n_nodes = 5
 
-        # (B) Scale model size to dataset complexity
-        # For simple tasks (few classes, tiny images), use smaller models
-        if self.num_classes <= 10 and spatial_size <= 512:
-            # Very simple tasks (e.g., Gutenberg: 6 classes, 27x18)
-            self.cell_counts = [2, 3]
-            self.init_channels_options = [16, 24]
-        elif spatial_size <= 256:  # very small images (e.g., 16x16 or smaller)
+        # Search space sizing:
+        # Simple tasks (e.g., Gutenberg: 6 classes, 27x18) -> small models to avoid overfitting
+        # Everything else -> generous space to allow high-capacity models
+        if self.is_simple_task:
             self.cell_counts = [2, 3, 4]
             self.init_channels_options = [16, 24, 32]
-        elif spatial_size <= 1024:  # small images (e.g., 32x32)
+            self.max_params = 2_000_000
+        elif spatial_size <= 1024:  # medium images (28x28, 32x32)
             self.cell_counts = [3, 4, 5]
-            self.init_channels_options = [24, 32, 48]
-        else:  # larger images (e.g., 64x64)
-            self.cell_counts = [4, 5, 6]
             self.init_channels_options = [32, 48, 64]
+            self.max_params = 15_000_000
+        else:  # larger images (64x64+)
+            self.cell_counts = [3, 4, 5, 6]
+            self.init_channels_options = [32, 48, 64]
+            self.max_params = 15_000_000
 
-        # (A) Ideal param count heuristic — used for penalty in scoring
-        self.ideal_params = self.num_classes * 50_000  # ~50K params per class
-
-        # (C) Budget-aware: how many candidates to evaluate
-        # Larger images need more exploration
+        # Budget-aware: how many candidates to evaluate
         if self.time_remaining > 18000:  # > 5 hours
             self.n_candidates = 80
         elif self.time_remaining > 7200:  # > 2 hours
             self.n_candidates = 50
         elif self.time_remaining > 3600:  # > 1 hour
-            base = 30
-            # More candidates for larger images (need more exploration)
-            if spatial_size > 1024:
-                base = 40
-            self.n_candidates = base
+            self.n_candidates = 40 if self.is_large_spatial else 30
         else:
             self.n_candidates = 25
 
@@ -113,21 +109,24 @@ class NAS:
     def search(self):
         print(f"  NAS Search | Device: {self.device} | Candidates: {self.n_candidates}")
         print(f"  Dataset: {self.in_channels}ch, {self.img_height}x{self.img_width}, "
-              f"{self.num_classes} classes")
+              f"{self.num_classes} classes | Simple: {self.is_simple_task}")
         print(f"  Search space: {self.n_nodes} nodes/cell, "
               f"cells={self.cell_counts}, channels={self.init_channels_options}")
+        print(f"  Max params: {self.max_params:,}")
 
         search_start = time.time()
         rng = random.Random(42)
 
+        # ==================================================================
         # PHASE 1: Sample candidates and score with training-free proxies
+        # ==================================================================
         candidates = []
         print(f"\n  Phase 1: Sampling and scoring {self.n_candidates} candidates...")
 
         for i in range(self.n_candidates):
-            # Check time budget (leave at least 80% for training)
+            # Check time budget (leave at least 85% for training)
             elapsed = time.time() - search_start
-            budget_for_search = self.time_remaining * 0.15  # use at most 15% for NAS
+            budget_for_search = self.time_remaining * 0.12  # use at most 12% for NAS
             if elapsed > budget_for_search:
                 print(f"  Time budget reached after {i} candidates ({show_time(elapsed)})")
                 break
@@ -146,10 +145,9 @@ class NAS:
             except Exception:
                 continue
 
-            # Compute parameter count — skip if too large relative to task complexity
+            # Compute parameter count — skip if exceeds max for this task
             param_count = compute_param_count(model)
-            max_params = min(10_000_000, self.ideal_params * 20)  # adaptive cap
-            if param_count > max_params:
+            if param_count > self.max_params:
                 continue
 
             # Compute NASWOT score
@@ -171,14 +169,16 @@ class NAS:
                 'island': island,
             })
 
-        print(f"  Evaluated {len(candidates)} valid candidates in {show_time(time.time() - search_start)}")
+        print(f"  Evaluated {len(candidates)} valid candidates in "
+              f"{show_time(time.time() - search_start)}")
 
         if not candidates:
-            # Fallback: return a simple default model
             print("  WARNING: No valid candidates found, using fallback model")
             return self._build_fallback_model()
 
+        # ==================================================================
         # PHASE 2: Normalize scores and compute combined ranking
+        # ==================================================================
         print("\n  Phase 2: Ranking candidates...")
 
         naswot_scores = normalize_scores([c['naswot'] for c in candidates])
@@ -191,14 +191,19 @@ class NAS:
                 naswot_scores[i], synflow_scores[i], naswot_weight=0.5
             )
 
-            # (A) Param count penalty — penalize overly large models for simple tasks
-            param_penalty = max(0, (c['params'] - self.ideal_params * 3) / (self.ideal_params * 10))
-            c['combined_score'] -= param_penalty
+            # Param penalty only for simple tasks where overfitting is the risk.
+            # For complex tasks, bigger models are generally better.
+            if self.is_simple_task:
+                ideal = self.num_classes * 50_000
+                penalty = max(0, (c['params'] - ideal * 3) / (ideal * 10))
+                c['combined_score'] -= penalty
 
         # Sort by combined score (descending)
         candidates.sort(key=lambda c: c['combined_score'], reverse=True)
 
+        # ==================================================================
         # PHASE 3: Diversity islands — pick best from each island
+        # ==================================================================
         print("\n  Phase 3: Diversity island selection...")
 
         islands = {}
@@ -213,14 +218,14 @@ class NAS:
         # Get champion from each island (best combined score)
         champions = []
         for island_name, members in islands.items():
-            # Already sorted globally, so first member in each island is its champion
             champion = members[0]
             champions.append(champion)
             print(f"    {island_name} champion: score={champion['combined_score']:.4f}, "
                   f"params={champion['params']:,}")
 
+        # ==================================================================
         # PHASE 4: Select overall best architecture
-        # Pick the overall champion (highest combined score)
+        # ==================================================================
         champions.sort(key=lambda c: c['combined_score'], reverse=True)
         best = champions[0]
 
@@ -238,9 +243,11 @@ class NAS:
             best['n_cells'], best['init_channels']
         )
 
+        # ==================================================================
         # PHASE 5 (Optional): Short validation warm-up if time permits
+        # ==================================================================
         elapsed = time.time() - search_start
-        remaining_for_warmup = (self.time_remaining * 0.05)  # 5% of total budget
+        remaining_for_warmup = (self.time_remaining * 0.05)
 
         if remaining_for_warmup > 30 and elapsed < (self.time_remaining * 0.10):
             print(f"\n  Phase 5: Validation warm-up ({show_time(remaining_for_warmup)} budget)...")
@@ -255,8 +262,7 @@ class NAS:
 
     def _validation_warmup(self, model, max_time=60):
         """
-        Short training warm-up on validation data to verify the model trains correctly.
-        This is NOT full training — just a few steps to ensure gradient flow is healthy.
+        Short training warm-up to verify gradient flow is healthy.
         """
         model.to(self.device)
         model.train()
@@ -266,7 +272,7 @@ class NAS:
 
         start = time.time()
         steps = 0
-        max_steps = 10  # very few steps
+        max_steps = 10
 
         try:
             for data, target in self.train_loader:
@@ -290,8 +296,7 @@ class NAS:
 
     def _build_fallback_model(self):
         """
-        Fallback: build a simple model if the search fails.
-        Uses a conservative 3-cell architecture with conv3x3 operations.
+        Fallback: build a simple default model if search fails.
         """
         cell_config = [
             ('conv3x3', 0),

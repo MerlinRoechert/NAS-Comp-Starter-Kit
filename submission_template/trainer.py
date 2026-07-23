@@ -31,13 +31,18 @@ class Trainer:
         self.max_epochs = self._epoch_cap()
         self.criterion = self._make_criterion()
 
-        # (E) Stronger weight decay for smaller/simpler datasets to reduce overfitting
+        # (E) Adaptive weight decay: stronger for simple tasks to reduce overfitting,
+        # standard for complex tasks to allow capacity
         n_samples = metadata.get('input_shape', [50000])[0]
         num_classes = metadata.get('num_classes', 10)
-        if num_classes <= 10 and n_samples >= 30_000:
-            wd = 1e-3  # stronger regularization for simple tasks prone to overfitting
+        spatial_size = 1
+        if len(metadata.get('input_shape', [])) >= 4:
+            spatial_size = metadata['input_shape'][2] * metadata['input_shape'][3]
+
+        if num_classes <= 10 and spatial_size <= 512:
+            wd = 2e-3  # strong regularization for simple/overfit-prone tasks
         else:
-            wd = 5e-4
+            wd = 5e-4  # standard
 
         self.optimizer = torch.optim.SGD(
             self.model.parameters(), lr=self.learning_rate, momentum=0.9,
@@ -59,10 +64,10 @@ class Trainer:
         """A coarse cap; measured epoch time supplies the real stopping rule."""
         remaining = max(0.0, self._time_left())
         n = len(getattr(self.train_dataloader, "dataset", ()))
-        # Small datasets benefit from more optimizer updates. Large datasets get
-        # fewer epochs and are governed mainly by the wall-clock check.
-        size_cap = 150 if n < 5_000 else (120 if n < 25_000 else 100)
-        time_cap = max(1, int(remaining / 30.0))
+        # Allow more epochs across the board — the wall-clock check is the
+        # real safety net. These caps just prevent extreme outliers.
+        size_cap = 200 if n < 5_000 else (150 if n < 25_000 else 120)
+        time_cap = max(1, int(remaining / 20.0))
         return min(size_cap, time_cap)
 
     def _make_criterion(self):
