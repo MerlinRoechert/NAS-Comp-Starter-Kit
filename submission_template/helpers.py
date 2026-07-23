@@ -163,7 +163,7 @@ class CellNetwork(nn.Module):
     A network built from stacked cells with optional downsampling between stages.
     """
     def __init__(self, in_channels, num_classes, cell_config, n_cells=3,
-                 init_channels=32, channel_multiplier=2):
+                 init_channels=32, channel_multiplier=2, dropout_rate=0.0):
         """
         Args:
             in_channels: number of input image channels
@@ -172,6 +172,7 @@ class CellNetwork(nn.Module):
             n_cells: total number of cells
             init_channels: initial channel width
             channel_multiplier: multiply channels at each downsampling stage
+            dropout_rate: dropout probability before classifier (0 = disabled)
         """
         super().__init__()
         self.n_cells = n_cells
@@ -211,6 +212,7 @@ class CellNetwork(nn.Module):
 
         # Global average pooling + classifier
         self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.dropout = nn.Dropout(p=dropout_rate) if dropout_rate > 0 else nn.Identity()
         self.classifier = nn.Linear(c_out, num_classes)
 
     def forward(self, x):
@@ -223,6 +225,7 @@ class CellNetwork(nn.Module):
 
         x = self.global_pool(x)
         x = x.view(x.size(0), -1)
+        x = self.dropout(x)
         x = self.classifier(x)
         return x
 
@@ -243,7 +246,7 @@ def sample_cell_config(n_nodes, rng=None):
         config.append((op, input_idx))
     return config
 
-def build_model_from_config(cell_config, in_channels, num_classes, n_cells, init_channels):
+def build_model_from_config(cell_config, in_channels, num_classes, n_cells, init_channels, dropout_rate=0.0):
     """Build a CellNetwork from a cell configuration."""
     return CellNetwork(
         in_channels=in_channels,
@@ -252,6 +255,7 @@ def build_model_from_config(cell_config, in_channels, num_classes, n_cells, init
         n_cells=n_cells,
         init_channels=init_channels,
         channel_multiplier=2,
+        dropout_rate=dropout_rate,
     )
 
 # TRAINING-FREE PROXY SCORES

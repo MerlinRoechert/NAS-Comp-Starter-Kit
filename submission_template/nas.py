@@ -73,17 +73,20 @@ class NAS:
         # Simple tasks (e.g., Gutenberg: 6 classes, 27x18) -> small models to avoid overfitting
         # Everything else -> generous space to allow high-capacity models
         if self.is_simple_task:
-            self.cell_counts = [2, 3, 4]
-            self.init_channels_options = [16, 24, 32]
-            self.max_params = 2_000_000
+            self.cell_counts = [2, 3]
+            self.init_channels_options = [16, 24]
+            self.max_params = 500_000
+            self.dropout_rate = 0.3
         elif spatial_size <= 1024:  # medium images (28x28, 32x32)
             self.cell_counts = [3, 4, 5]
             self.init_channels_options = [32, 48, 64]
             self.max_params = 15_000_000
+            self.dropout_rate = 0.1
         else:  # larger images (64x64+)
             self.cell_counts = [3, 4, 5, 6]
             self.init_channels_options = [32, 48, 64]
             self.max_params = 15_000_000
+            self.dropout_rate = 0.1
 
         # Budget-aware: how many candidates to evaluate
         if self.time_remaining > 18000:  # > 5 hours
@@ -140,7 +143,7 @@ class NAS:
             try:
                 model = build_model_from_config(
                     cell_config, self.in_channels, self.num_classes,
-                    n_cells, init_channels
+                    n_cells, init_channels, self.dropout_rate
                 )
             except Exception:
                 continue
@@ -240,7 +243,7 @@ class NAS:
         # Build the final model
         model = build_model_from_config(
             best['cell_config'], self.in_channels, self.num_classes,
-            best['n_cells'], best['init_channels']
+            best['n_cells'], best['init_channels'], self.dropout_rate
         )
 
         # ==================================================================
@@ -309,5 +312,6 @@ class NAS:
             self.num_classes,
             n_cells=3,
             init_channels=32,
+            dropout_rate=self.dropout_rate,
         )
         return model
