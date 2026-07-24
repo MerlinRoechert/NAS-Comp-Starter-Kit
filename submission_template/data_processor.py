@@ -181,11 +181,9 @@ class DataProcessor:
         self.metadata["seed"] = self.seed
 
         self.augmentations = [
-            AugmentationType.TRANSLATION,
             AugmentationType.PIXEL_NOISE,
-            AugmentationType.OCCLUSION,
         ]
-        self.augmentation_probability = 0.5
+        self.augmentation_probability = 0.3
         self.augmentation_value_range = None
 
         if AugmentationType.RGB in self.augmentations:
