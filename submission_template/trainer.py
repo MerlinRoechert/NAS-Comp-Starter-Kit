@@ -6,6 +6,8 @@ import time
 import torch
 import torch.nn as nn
 
+from helpers import build_model_from_config
+
 
 class Trainer:
     """Train the model while leaving enough time for test-set prediction.
@@ -178,7 +180,152 @@ class Trainer:
             time.perf_counter() - started,
             "{:.2f}%".format(100.0 * self._best_accuracy)
             if self._best_accuracy >= 0 else "unavailable"))
+
+        # =================================================================
+        # INCUMBENT CHALLENGE: If time permits, train a runner-up and keep
+        # whichever model has better validation accuracy.
+        # =================================================================
+        self._try_runner_ups(epoch_seconds or 15.0, reserve)
+
         return self.model
+
+    def _try_runner_ups(self, epoch_seconds, reserve):
+        """
+        If enough time remains after primary training, train runner-up
+        architectures and keep the best (incumbent challenge).
+        """
+        runner_ups = self.metadata.get('runner_up_configs', [])
+        if not runner_ups:
+            return
+
+        # Need enough time for at least ~20 epochs of the runner-up + prediction
+        min_time_needed = epoch_seconds * 20 + reserve + 60
+        time_left = self._time_left()
+
+        if time_left <= min_time_needed:
+            print(f"\n  No time for runner-up challenge ({time_left:.0f}s left, "
+                  f"need {min_time_needed:.0f}s)")
+            return
+
+        incumbent_accuracy = self._best_accuracy
+        dropout_rate = self.metadata.get('dropout_rate', 0.1)
+        in_channels = self.metadata['input_shape'][1]
+        num_classes = self.metadata['num_classes']
+
+        print(f"\n  === Runner-Up Challenge (incumbent: {100*incumbent_accuracy:.2f}%) ===")
+
+        for idx, runner in enumerate(runner_ups):
+            # Re-check time before each runner-up
+            time_left = self._time_left()
+            if time_left <= min_time_needed:
+                print(f"  Skipping runner-up {idx+1} (insufficient time)")
+                break
+
+            print(f"  Training runner-up {idx+1}: {runner['island']} "
+                  f"({runner['params']:,} params)...")
+
+            try:
+                challenger = build_model_from_config(
+                    runner['cell_config'], in_channels, num_classes,
+                    runner['n_cells'], runner['init_channels'], dropout_rate
+                )
+            except Exception:
+                print(f"    Failed to build runner-up, skipping")
+                continue
+
+            challenger.to(self.device)
+            challenger_acc = self._train_challenger(challenger, reserve)
+
+            if challenger_acc is not None and challenger_acc > incumbent_accuracy:
+                print(f"    Runner-up WINS: {100*challenger_acc:.2f}% > "
+                      f"{100*incumbent_accuracy:.2f}%")
+                self.model = challenger
+                self._best_accuracy = challenger_acc
+                incumbent_accuracy = challenger_acc
+            else:
+                acc_str = f"{100*challenger_acc:.2f}%" if challenger_acc else "N/A"
+                print(f"    Incumbent holds: {acc_str} <= "
+                      f"{100*incumbent_accuracy:.2f}%")
+                # Free challenger memory
+                del challenger
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    def _train_challenger(self, model, reserve):
+        """Train a challenger model with remaining time and return its best val accuracy."""
+        model.train()
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=self.learning_rate, momentum=0.9,
+            nesterov=True, weight_decay=5e-4,
+        )
+        scaler = torch.cuda.amp.GradScaler(enabled=self._use_amp)
+        best_acc = -1.0
+        best_state = None
+
+        batches_per_epoch = max(1, len(self.train_dataloader))
+        # Use remaining time minus reserve for training
+        max_epochs = min(self.max_epochs, max(1, int(self._time_left() / 30.0)))
+        total_steps = max(1, max_epochs * batches_per_epoch)
+        global_step = 0
+
+        for epoch in range(max_epochs):
+            if self._time_left() <= reserve + 60:
+                break
+
+            model.train()
+            for data, target in self.train_dataloader:
+                if self._time_left() <= reserve + 60:
+                    break
+                data = data.to(self.device, non_blocking=True)
+                target = target.to(self.device, non_blocking=True).long()
+
+                # Cosine LR schedule
+                warmup = max(1, int(0.10 * total_steps))
+                if global_step < warmup:
+                    factor = float(global_step + 1) / warmup
+                else:
+                    progress = (global_step - warmup) / max(1, total_steps - warmup)
+                    factor = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+                lr = self.learning_rate * factor
+                for group in optimizer.param_groups:
+                    group["lr"] = lr
+
+                optimizer.zero_grad(set_to_none=True)
+                with torch.cuda.amp.autocast(enabled=self._use_amp):
+                    output = self._logits(model(data))
+                    loss = self.criterion(output, target)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                global_step += 1
+
+            # Evaluate
+            model.eval()
+            correct = 0
+            seen = 0
+            with torch.no_grad():
+                for data, target in self.valid_dataloader:
+                    if self._time_left() <= reserve:
+                        break
+                    data = data.to(self.device, non_blocking=True)
+                    target = target.to(self.device, non_blocking=True).long()
+                    with torch.cuda.amp.autocast(enabled=self._use_amp):
+                        output = self._logits(model(data))
+                    correct += (output.argmax(1) == target).sum().item()
+                    seen += target.numel()
+
+            if seen > 0:
+                val_acc = correct / seen
+                if val_acc > best_acc:
+                    best_acc = val_acc
+                    best_state = {k: v.detach().cpu().clone()
+                                  for k, v in model.state_dict().items()}
+
+        # Restore best state
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        model.to(self.device)
+
+        return best_acc if best_acc >= 0 else None
 
     def evaluate(self, reserve=0.0):
         self.model.eval()

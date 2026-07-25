@@ -218,6 +218,19 @@ class NAS:
         champions.sort(key=lambda c: c['combined_score'], reverse=True)
         best = champions[0]
 
+        # Save runner-up configs in metadata so Trainer can try them if time permits
+        runner_ups = []
+        for champ in champions[1:3]:  # top 2 runner-ups
+            runner_ups.append({
+                'cell_config': champ['cell_config'],
+                'n_cells': champ['n_cells'],
+                'init_channels': champ['init_channels'],
+                'params': champ['params'],
+                'island': champ['island'],
+            })
+        self.metadata['runner_up_configs'] = runner_ups
+        self.metadata['dropout_rate'] = self.dropout_rate
+
         print(f"\n  Selected architecture:")
         print(f"    Island: {best['island']}")
         print(f"    Cells: {best['n_cells']}, Init channels: {best['init_channels']}")
@@ -225,6 +238,9 @@ class NAS:
         print(f"    NASWOT (norm): {best['naswot_norm']:.4f}")
         print(f"    SynFlow (norm): {best['synflow_norm']:.4f}")
         print(f"    Combined score: {best['combined_score']:.4f}")
+        if runner_ups:
+            print(f"    Runner-ups saved: {len(runner_ups)} "
+                  f"({', '.join(r['island'] for r in runner_ups)})")
 
         # Build the final model
         model = build_model_from_config(
