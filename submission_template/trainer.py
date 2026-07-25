@@ -115,8 +115,6 @@ class Trainer:
         global_step = 0
         epoch_seconds = None
         started = time.perf_counter()
-        patience_counter = 0
-        patience_limit = 20  # early stop if no improvement for 20 epochs
 
         print("  Trainer: SGD+nesterov, cosine decay, AMP={}, epoch cap={}, "
               "prediction reserve={:.0f}s".format(
@@ -163,23 +161,15 @@ class Trainer:
             train_accuracy = correct / max(1, seen)
             if valid_accuracy is not None and valid_accuracy > self._best_accuracy:
                 self._best_accuracy = valid_accuracy
-                patience_counter = 0
                 # CPU checkpoint avoids consuming scarce accelerator memory.
                 self._best_state = {
                     key: value.detach().cpu().clone()
                     for key, value in self.model.state_dict().items()
                 }
-            else:
-                patience_counter += 1
             print("  Epoch {:>3}/{:<3} | train {:>6.2f}% | valid {} | {:.1f}s".format(
                 epoch + 1, self.max_epochs, 100.0 * train_accuracy,
                 "{:>6.2f}%".format(100.0 * valid_accuracy)
                 if valid_accuracy is not None else "skipped", epoch_seconds))
-
-            # Early stopping: no improvement for too long means overfitting
-            if patience_counter >= patience_limit and epoch >= 30:
-                print(f"  Early stopping at epoch {epoch + 1} (no improvement for {patience_limit} epochs)")
-                break
 
         if self._best_state is not None:
             self.model.load_state_dict(self._best_state)
