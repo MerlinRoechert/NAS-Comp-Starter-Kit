@@ -73,8 +73,8 @@ class NAS:
         if self.is_simple_task:
             self.cell_counts = [2, 3]
             self.init_channels_options = [16, 24]
-            self.max_params = 500_000
-            self.dropout_rate = 0.3
+            self.max_params = 100_000
+            self.dropout_rate = 0.5
         elif spatial_size <= 1024:
             self.cell_counts = [3, 4, 5]
             self.init_channels_options = [32, 48, 64]
