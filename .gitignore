@@ -5,3 +5,6 @@ package
 package/*
 scoring
 scoring/*
+
+local_submission/*
+tests/*
