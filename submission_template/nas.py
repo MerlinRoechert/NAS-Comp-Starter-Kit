@@ -3,6 +3,9 @@ nas.py - Neural Architecture Search using training-free proxies (NASWOT + SynFlo
 a cell-based search space, diversity islands, and budget-aware candidate selection.
 """
 
+import json
+import math
+import os
 import time
 import random
 
@@ -16,9 +19,12 @@ from helpers import (
     compute_naswot_score,
     compute_synflow_score,
     compute_param_count,
-    normalize_scores,
+    robust_normalize,
     compute_combined_score,
     assign_island,
+    architecture_descriptor,
+    diversity_summary,
+    select_diverse_candidates,
 )
 
 
@@ -47,6 +53,27 @@ class NAS:
 
         # Search space parameters — adapted to dataset complexity
         self._configure_search_space()
+        self.proxy_weights = self._load_proxy_weights()
+
+    def _time_left(self):
+        try:
+            return float(self.clock.check())
+        except Exception:
+            return float(self.metadata.get("time_remaining", 3600.0))
+
+    def _load_proxy_weights(self):
+        """Use calibration output when it has been copied into the submission."""
+        weights = {"naswot": 0.5, "synflow": 0.5}
+        path = os.path.join(os.path.dirname(__file__), "proxy_weights.json")
+        try:
+            with open(path, "r") as handle:
+                loaded = json.load(handle)
+            naswot = float(loaded.get("naswot_weight", 0.5))
+            if 0.0 <= naswot <= 1.0:
+                weights = {"naswot": naswot, "synflow": 1.0 - naswot}
+        except Exception:
+            pass
+        return weights
 
     def _configure_search_space(self):
         """
@@ -54,11 +81,16 @@ class NAS:
         Key insight: only constrain model size for truly simple tasks that are
         prone to overfitting. For complex tasks, allow large models.
         """
-        n_datapoints = self.input_shape[0]
+        diagnostics = self.metadata.get("diagnostics", {})
+        n_datapoints = diagnostics.get("n_train", self.input_shape[0])
         spatial_size = self.img_height * self.img_width
 
         # Estimate dataset complexity
-        self.is_simple_task = (self.num_classes <= 10 and spatial_size <= 512)
+        imbalance = diagnostics.get("class_imbalance_ratio", 1.0)
+        self.is_simple_task = (
+            self.num_classes <= 10 and spatial_size <= 512 and
+            n_datapoints < 25000
+        )
         self.is_large_spatial = (spatial_size > 1024)
 
         # Nodes per cell: 3-5 depending on complexity
@@ -73,8 +105,8 @@ class NAS:
         if self.is_simple_task:
             self.cell_counts = [2, 3]
             self.init_channels_options = [16, 24]
-            self.max_params = 100_000
-            self.dropout_rate = 0.5
+            self.max_params = 750_000 if n_datapoints >= 5000 else 300_000
+            self.dropout_rate = 0.35 if n_datapoints < 5000 else 0.20
         elif spatial_size <= 1024:
             self.cell_counts = [3, 4, 5]
             self.init_channels_options = [32, 48, 64]
@@ -85,6 +117,8 @@ class NAS:
             self.init_channels_options = [32, 48, 64]
             self.max_params = 15_000_000
             self.dropout_rate = 0.1
+        if imbalance >= 10.0:
+            self.dropout_rate = min(0.4, self.dropout_rate + 0.1)
 
         # Budget-aware candidate count
         if self.time_remaining > 18000:
@@ -115,7 +149,10 @@ class NAS:
               f"cells={self.cell_counts}, channels={self.init_channels_options}")
         print(f"  Max params: {self.max_params:,}")
 
-        search_start = time.time()
+        search_start = time.perf_counter()
+        search_deadline = max(15.0, min(
+            self.time_remaining * 0.12,
+            max(15.0, self._time_left() - self._prediction_reserve() - 60.0)))
         rng = random.Random(42)
 
         # ==================================================================
@@ -125,9 +162,8 @@ class NAS:
         print(f"\n  Phase 1: Sampling and scoring {self.n_candidates} candidates...")
 
         for i in range(self.n_candidates):
-            elapsed = time.time() - search_start
-            budget_for_search = self.time_remaining * 0.12
-            if elapsed > budget_for_search:
+            elapsed = time.perf_counter() - search_start
+            if elapsed > search_deadline or self._time_left() <= self._prediction_reserve() + 60:
                 print(f"  Time budget reached after {i} candidates ({show_time(elapsed)})")
                 break
 
@@ -147,8 +183,20 @@ class NAS:
             if param_count > self.max_params:
                 continue
 
-            naswot_score = compute_naswot_score(model, self.train_loader, self.device)
-            synflow_score = compute_synflow_score(model, self.train_loader, self.device)
+            try:
+                naswot_score = compute_naswot_score(
+                    model, self.train_loader, self.device, max_samples=24)
+                synflow_score = compute_synflow_score(
+                    model, self.train_loader, self.device)
+            except RuntimeError as error:
+                if "out of memory" in str(error).lower():
+                    print("  Candidate OOM; reducing search model size")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    self.max_params = max(100000, self.max_params // 2)
+                    del model
+                    continue
+                raise
             island = assign_island(cell_config, n_cells, init_channels)
 
             candidates.append({
@@ -159,10 +207,16 @@ class NAS:
                 'synflow': synflow_score,
                 'params': param_count,
                 'island': island,
+                'descriptor': architecture_descriptor(
+                    cell_config, n_cells, init_channels, param_count),
             })
+            model.cpu()
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         print(f"  Evaluated {len(candidates)} valid candidates in "
-              f"{show_time(time.time() - search_start)}")
+              f"{show_time(time.perf_counter() - search_start)}")
 
         if not candidates:
             print("  WARNING: No valid candidates found, using fallback model")
@@ -173,14 +227,18 @@ class NAS:
         # ==================================================================
         print("\n  Phase 2: Ranking candidates...")
 
-        naswot_scores = normalize_scores([c['naswot'] for c in candidates])
-        synflow_scores = normalize_scores([c['synflow'] for c in candidates])
+        naswot_scores = robust_normalize([c['naswot'] for c in candidates])
+        # log1p reduces SynFlow's strong width/depth scale bias before ranking.
+        synflow_scores = robust_normalize([
+            math.log1p(max(0.0, c['synflow'])) for c in candidates
+        ])
 
         for i, c in enumerate(candidates):
             c['naswot_norm'] = naswot_scores[i]
             c['synflow_norm'] = synflow_scores[i]
             c['combined_score'] = compute_combined_score(
-                naswot_scores[i], synflow_scores[i], naswot_weight=0.5
+                naswot_scores[i], synflow_scores[i],
+                naswot_weight=self.proxy_weights["naswot"]
             )
 
             # Param penalty only for simple tasks
@@ -191,36 +249,28 @@ class NAS:
 
         candidates.sort(key=lambda c: c['combined_score'], reverse=True)
 
-        # ==================================================================
-        # PHASE 3: Diversity islands — pick best from each island
-        # ==================================================================
-        print("\n  Phase 3: Diversity island selection...")
+        print("\n  Phase 3: Measured diversity selection...")
+        finalist_count = min(5 if self._time_left() > 3600 else 3, len(candidates))
+        champions = select_diverse_candidates(candidates, finalist_count)
+        diversity = diversity_summary(champions)
+        self.metadata["diversity"] = diversity
+        print("  Selected {} finalists | descriptor distance "
+              "min={minimum:.3f}, mean={mean:.3f}, max={maximum:.3f}".format(
+                  len(champions), **diversity))
 
-        islands = {}
-        for c in candidates:
-            island_name = c['island']
-            if island_name not in islands:
-                islands[island_name] = []
-            islands[island_name].append(c)
-
-        print(f"  Islands: {', '.join(f'{k}({len(v)})' for k, v in islands.items())}")
-
-        champions = []
-        for island_name, members in islands.items():
-            champion = members[0]
-            champions.append(champion)
-            print(f"    {island_name} champion: score={champion['combined_score']:.4f}, "
-                  f"params={champion['params']:,}")
-
-        # ==================================================================
-        # PHASE 4: Select overall best architecture by proxy score
-        # ==================================================================
-        champions.sort(key=lambda c: c['combined_score'], reverse=True)
-        best = champions[0]
+        # Proxy scores filter the space. Equal-budget short training decides the
+        # champion whenever the live budget can support it.
+        best = self._successive_halving(champions)
 
         # Save runner-up configs in metadata so Trainer can try them if time permits
         runner_ups = []
-        for champ in champions[1:3]:  # top 2 runner-ups
+        ranked_champions = sorted(
+            champions,
+            key=lambda c: c.get("short_accuracy", -1.0),
+            reverse=True)
+        for champ in ranked_champions:
+            if champ is best:
+                continue
             runner_ups.append({
                 'cell_config': champ['cell_config'],
                 'n_cells': champ['n_cells'],
@@ -228,6 +278,8 @@ class NAS:
                 'params': champ['params'],
                 'island': champ['island'],
             })
+            if len(runner_ups) == 2:
+                break
         self.metadata['runner_up_configs'] = runner_ups
         self.metadata['dropout_rate'] = self.dropout_rate
 
@@ -251,7 +303,7 @@ class NAS:
         # ==================================================================
         # PHASE 5: Short validation warm-up if time permits
         # ==================================================================
-        elapsed = time.time() - search_start
+        elapsed = time.perf_counter() - search_start
         remaining_for_warmup = (self.time_remaining * 0.05)
 
         if remaining_for_warmup > 30 and elapsed < (self.time_remaining * 0.10):
@@ -260,10 +312,87 @@ class NAS:
         else:
             print(f"\n  Skipping validation warm-up (time constraint)")
 
-        total_time = time.time() - search_start
+        total_time = time.perf_counter() - search_start
         print(f"\n  NAS complete in {show_time(total_time)}")
 
         return model
+
+    def _prediction_reserve(self):
+        test_size = int(self.metadata.get("test_size", 0))
+        baseline = max(45.0, 0.08 * max(0.0, self.time_remaining))
+        return min(600.0, baseline + test_size * 0.002)
+
+    def _successive_halving(self, finalists):
+        """Short-train diverse finalists with identical update budgets."""
+        if len(finalists) <= 1 or self._time_left() < 600:
+            print("  Short finalist training skipped; using proxy leader")
+            return max(finalists, key=lambda c: c["combined_score"])
+        available = self._time_left() - self._prediction_reserve()
+        phase_budget = min(300.0, max(60.0, available * 0.10))
+        per_model = phase_budget / len(finalists)
+        survivors = []
+        for candidate in finalists:
+            if self._time_left() <= self._prediction_reserve() + 90:
+                break
+            model = build_model_from_config(
+                candidate["cell_config"], self.in_channels, self.num_classes,
+                candidate["n_cells"], candidate["init_channels"],
+                self.dropout_rate)
+            accuracy = self._short_train_accuracy(model, per_model)
+            candidate["short_accuracy"] = accuracy
+            if accuracy >= 0.0:
+                survivors.append(candidate)
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print("    {:<14} proxy={:.3f} short-val={}".format(
+                candidate["island"], candidate["combined_score"],
+                "{:.2%}".format(accuracy) if accuracy >= 0 else "failed"))
+        if not survivors:
+            return max(finalists, key=lambda c: c["combined_score"])
+        survivors.sort(
+            key=lambda c: (c["short_accuracy"], c["combined_score"]),
+            reverse=True)
+        return survivors[0]
+
+    def _short_train_accuracy(self, model, seconds):
+        model.to(self.device)
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=0.03, momentum=0.9, weight_decay=5e-4)
+        criterion = nn.CrossEntropyLoss()
+        started = time.perf_counter()
+        steps = 0
+        try:
+            model.train()
+            while time.perf_counter() - started < seconds * 0.70 and steps < 40:
+                for data, target in self.train_loader:
+                    if time.perf_counter() - started >= seconds * 0.70:
+                        break
+                    data = data.to(self.device)
+                    target = target.to(self.device).long()
+                    optimizer.zero_grad()
+                    loss = criterion(model(data), target)
+                    loss.backward()
+                    optimizer.step()
+                    steps += 1
+            model.eval()
+            correct = seen = 0
+            with torch.no_grad():
+                for data, target in self.valid_loader:
+                    if time.perf_counter() - started >= seconds:
+                        break
+                    data = data.to(self.device)
+                    target = target.to(self.device).long()
+                    correct += (model(data).argmax(1) == target).sum().item()
+                    seen += target.numel()
+                    if seen >= 1024:
+                        break
+            return correct / float(seen) if seen else -1.0
+        except RuntimeError as error:
+            if "out of memory" in str(error).lower() and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                return -1.0
+            raise
 
     def _validation_warmup(self, model, max_time=60):
         """Short training warm-up to verify gradient flow is healthy."""

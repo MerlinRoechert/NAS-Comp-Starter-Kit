@@ -259,7 +259,7 @@ def build_model_from_config(cell_config, in_channels, num_classes, n_cells, init
     )
 
 # TRAINING-FREE PROXY SCORES
-def compute_naswot_score(model, dataloader, device, n_batches=1):
+def compute_naswot_score(model, dataloader, device, n_batches=1, max_samples=32):
     """
     Compute the NASWOT (Neural Architecture Search Without Training) score.
     Based on Mellor et al. (ICML 2021): measures the correlation of activations
@@ -307,7 +307,7 @@ def compute_naswot_score(model, dataloader, device, n_batches=1):
                 h.remove()
             return 0.0
 
-        batch_data = batch_data.to(device)
+        batch_data = batch_data[:max_samples].to(device)
         with torch.no_grad():
             model(batch_data)
     except Exception:
@@ -432,26 +432,95 @@ def compute_param_count(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 # DIVERSITY ISLANDS
-def classify_architecture(cell_config, n_cells, init_channels):
-    """
-    Classify an architecture into a diversity island based on its properties.
-    Islands:
-      - 'efficient': low param count (small channels, fewer cells, separable convs)
-      - 'deep': more cells, deeper networks
-      - 'residual': has skip connections
-    """
-    has_skip = any(op == 'skip' for op, _ in cell_config)
-    has_sep = any('sep' in op for op, _ in cell_config)
-    has_pool = any('pool' in op for op, _ in cell_config)
-    heavy_ops = sum(1 for op, _ in cell_config if op in ('conv5x5', 'sep5x5'))
+def architecture_descriptor(cell_config, n_cells, init_channels, param_count=None):
+    """Continuous, scale-aware descriptor used for measured diversity.
 
-    # Heuristic classification
-    if has_skip and has_sep:
-        return 'residual'
-    elif n_cells >= 5 or heavy_ops >= 2:
-        return 'deep'
-    else:
-        return 'efficient'
+    Operation frequencies describe the cell, source statistics describe graph
+    connectivity, and depth/width/size describe the macro architecture.
+    """
+    count = float(max(1, len(cell_config)))
+    op_frequencies = [
+        sum(op == name for op, _ in cell_config) / count for name in OP_NAMES
+    ]
+    sources = [source for _, source in cell_config]
+    source_depth = sum(sources) / max(1.0, sum(range(len(cell_config))))
+    direct_input = sum(source == 0 for source in sources) / count
+    descriptor = op_frequencies + [
+        source_depth,
+        direct_input,
+        min(1.0, n_cells / 6.0),
+        min(1.0, math.log2(max(1, init_channels)) / 7.0),
+    ]
+    if param_count is not None:
+        descriptor.append(min(1.0, math.log10(max(10, param_count)) / 8.0))
+    return descriptor
+
+
+def descriptor_distance(left, right):
+    """Root-mean-square distance between architecture descriptors."""
+    if len(left) != len(right):
+        raise ValueError("architecture descriptors must have equal lengths")
+    return math.sqrt(sum((a - b) ** 2 for a, b in zip(left, right)) /
+                     max(1, len(left)))
+
+
+def select_diverse_candidates(candidates, count, quality_key="combined_score"):
+    """Quality-seeded farthest-first selection.
+
+    The first model is the best proxy candidate. Later models maximize their
+    minimum distance to the selected set, with a small quality tie-breaker.
+    """
+    if not candidates or count <= 0:
+        return []
+    ordered = sorted(candidates, key=lambda c: c[quality_key], reverse=True)
+    selected = [ordered[0]]
+    remaining = ordered[1:]
+    quality_values = robust_normalize([c[quality_key] for c in ordered])
+    quality = {id(c): value for c, value in zip(ordered, quality_values)}
+    while remaining and len(selected) < count:
+        def selection_score(candidate):
+            distance = min(
+                descriptor_distance(candidate["descriptor"], chosen["descriptor"])
+                for chosen in selected
+            )
+            return distance + 0.15 * quality[id(candidate)]
+        winner = max(remaining, key=selection_score)
+        selected.append(winner)
+        remaining.remove(winner)
+    return selected
+
+
+def diversity_summary(candidates):
+    """Return auditable pairwise descriptor-distance statistics."""
+    distances = []
+    for index, left in enumerate(candidates):
+        for right in candidates[index + 1:]:
+            distances.append(descriptor_distance(left["descriptor"],
+                                                 right["descriptor"]))
+    if not distances:
+        return {"minimum": 0.0, "mean": 0.0, "maximum": 0.0}
+    return {
+        "minimum": float(min(distances)),
+        "mean": float(sum(distances) / len(distances)),
+        "maximum": float(max(distances)),
+    }
+
+
+def classify_architecture(cell_config, n_cells, init_channels):
+    """Human-readable label used only for logging, not diversity selection."""
+    descriptor = architecture_descriptor(cell_config, n_cells, init_channels)
+    skip_fraction = descriptor[OP_NAMES.index("skip")]
+    pool_fraction = (descriptor[OP_NAMES.index("avg_pool")] +
+                     descriptor[OP_NAMES.index("max_pool")])
+    if skip_fraction >= 0.25:
+        return "skip-rich"
+    if pool_fraction >= 0.25:
+        return "pool-rich"
+    if n_cells >= 5:
+        return "deep"
+    if init_channels <= 24:
+        return "compact"
+    return "convolutional"
 
 def assign_island(cell_config, n_cells, init_channels):
     """Assign an architecture to a diversity island."""
@@ -474,6 +543,21 @@ def normalize_scores(scores):
     if max_s - min_s < 1e-10:
         return [0.5] * len(scores)
     return [(s - min_s) / (max_s - min_s) for s in scores]
+
+
+def robust_normalize(scores):
+    """Rank-normalize finite scores, avoiding min/max sensitivity to outliers."""
+    if not scores:
+        return []
+    finite = [float(s) if math.isfinite(float(s)) else -float("inf")
+              for s in scores]
+    order = sorted(range(len(finite)), key=lambda index: finite[index])
+    result = [0.0] * len(finite)
+    if len(order) == 1:
+        return [0.5]
+    for rank, index in enumerate(order):
+        result[index] = rank / float(len(order) - 1)
+    return result
 
 class AugmentationType(Enum):
     TRANSLATION = "translation"
@@ -642,9 +726,14 @@ def get_available_cpu_memory():
             return int(status.available_physical)
 
     if hasattr(os, "sysconf"):
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        available_pages = os.sysconf("SC_AVPHYS_PAGES")
-        return int(page_size * available_pages)
+        try:
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            available_pages = os.sysconf("SC_AVPHYS_PAGES")
+            return int(page_size * available_pages)
+        except (OSError, ValueError):
+            # macOS does not expose SC_AVPHYS_PAGES. Batch-size selection has a
+            # conservative fallback when available memory is unknown.
+            return None
 
     return None
 

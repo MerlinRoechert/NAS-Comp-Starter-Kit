@@ -7,3 +7,7 @@ package
 package/*
 scoring
 scoring/*
+
+local_submission/*
+local_smoke/
+predictions/

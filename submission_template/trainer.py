@@ -1,6 +1,7 @@
 """Budget-aware, dataset-independent model training for the competition."""
 
 import math
+import os
 import time
 
 import torch
@@ -55,6 +56,13 @@ class Trainer:
         self._scaler = torch.cuda.amp.GradScaler(enabled=self._use_amp) # pinned cuda version likely uses old (now deprecated) api
         self._best_state = None
         self._best_accuracy = -1.0
+        self._epochs_without_improvement = 0
+        self._ensemble_models = []
+        safe_codename = "".join(
+            c if c.isalnum() or c in "-_" else "_"
+            for c in str(metadata.get("codename", "dataset")))
+        self._checkpoint_path = os.path.join(
+            "predictions", "{}_best.pt".format(safe_codename))
 
     def _time_left(self):
         try:
@@ -75,17 +83,41 @@ class Trainer:
     def _make_criterion(self):
         # Mild label smoothing is a robust regularizer on unknown image tasks.
         # Retain compatibility with older PyTorch installations.
+        diagnostics = self.metadata.get("diagnostics", {})
+        smoothing = 0.05 if diagnostics.get("encoded_likely") else 0.1
+        weights = None
+        labels = getattr(getattr(self.train_dataloader, "dataset", None),
+                         "y", None)
+        if labels is not None and diagnostics.get("class_imbalance_ratio", 1.0) >= 3:
+            labels = torch.as_tensor(labels, dtype=torch.long)
+            counts = torch.bincount(
+                labels, minlength=int(self.metadata["num_classes"])).float()
+            weights = counts.sum() / counts.clamp_min(1.0)
+            weights = weights / weights.mean()
         try:
-            return nn.CrossEntropyLoss(label_smoothing=0.1)
+            return nn.CrossEntropyLoss(
+                weight=weights, label_smoothing=smoothing)
         except TypeError:
-            return nn.CrossEntropyLoss()
+            return nn.CrossEntropyLoss(weight=weights)
 
     def _prediction_reserve(self):
         """Keep a conservative tail for restoring weights and prediction."""
         initial = float(self.metadata.get("time_remaining", self._time_left()))
         # Ten percent is useful for short stress tests; cap it so long allocations
         # do not waste hours. The 30 second floor covers loader/model startup.
-        return min(300.0, max(30.0, 0.10 * max(0.0, initial)))
+        test_size = int(self.metadata.get("test_size", 0))
+        return min(600.0, max(
+            45.0, 0.10 * max(0.0, initial), 30.0 + 0.003 * test_size))
+
+    def _save_checkpoint(self):
+        """Persist the incumbent as a second line of defence against failures."""
+        try:
+            directory = os.path.dirname(self._checkpoint_path)
+            if directory and not os.path.isdir(directory):
+                os.makedirs(directory)
+            torch.save(self._best_state, self._checkpoint_path)
+        except Exception as error:
+            print("  Checkpoint warning: {}".format(error))
 
     def _set_learning_rate(self, step, total_steps):
         """Ten-percent warm-up followed by per-step cosine decay.
@@ -111,6 +143,7 @@ class Trainer:
 
     def train(self):
         self.model.to(self.device)
+        self.criterion.to(self.device)
         reserve = self._prediction_reserve()
         batches_per_epoch = max(1, len(self.train_dataloader))
         total_steps = max(1, self.max_epochs * batches_per_epoch)
@@ -139,20 +172,10 @@ class Trainer:
                 if self._time_left() <= reserve:
                     stopped_early = True
                     break
-                data = data.to(self.device, non_blocking=True)
-                target = target.to(self.device, non_blocking=True).long()
                 self._set_learning_rate(global_step, total_steps)
-                self.optimizer.zero_grad(set_to_none=True)
-
-                with torch.cuda.amp.autocast(enabled=self._use_amp): # pinned cuda version likely uses old (now deprecated) api
-                    output = self._logits(self.model(data))
-                    loss = self.criterion(output, target)
-                self._scaler.scale(loss).backward()
-                self._scaler.step(self.optimizer)
-                self._scaler.update()
-
-                correct += (output.detach().argmax(1) == target).sum().item()
-                seen += target.numel()
+                batch_correct, batch_seen = self._train_batch(data, target)
+                correct += batch_correct
+                seen += batch_seen
                 global_step += 1
 
             epoch_seconds = time.perf_counter() - epoch_start
@@ -163,15 +186,25 @@ class Trainer:
             train_accuracy = correct / max(1, seen)
             if valid_accuracy is not None and valid_accuracy > self._best_accuracy:
                 self._best_accuracy = valid_accuracy
+                self._epochs_without_improvement = 0
                 # CPU checkpoint avoids consuming scarce accelerator memory.
                 self._best_state = {
                     key: value.detach().cpu().clone()
                     for key, value in self.model.state_dict().items()
                 }
+                self._save_checkpoint()
+            elif valid_accuracy is not None:
+                self._epochs_without_improvement += 1
             print("  Epoch {:>3}/{:<3} | train {:>6.2f}% | valid {} | {:.1f}s".format(
                 epoch + 1, self.max_epochs, 100.0 * train_accuracy,
                 "{:>6.2f}%".format(100.0 * valid_accuracy)
                 if valid_accuracy is not None else "skipped", epoch_seconds))
+            patience = 12 if len(self.train_dataloader) < 100 else 7
+            if (epoch >= 10 and
+                    self._epochs_without_improvement >= patience):
+                print("  Early stopping after {} stale epochs".format(
+                    self._epochs_without_improvement))
+                break
 
         if self._best_state is not None:
             self.model.load_state_dict(self._best_state)
@@ -188,6 +221,42 @@ class Trainer:
         self._try_runner_ups(epoch_seconds or 15.0, reserve)
 
         return self.model
+
+    def _train_batch(self, cpu_data, cpu_target):
+        """Train with automatic microbatch fallback after accelerator OOM."""
+        microbatch = len(cpu_data)
+        while microbatch >= 1:
+            self.optimizer.zero_grad(set_to_none=True)
+            correct = seen = 0
+            try:
+                for start in range(0, len(cpu_data), microbatch):
+                    data = cpu_data[start:start + microbatch].to(
+                        self.device, non_blocking=True)
+                    target = cpu_target[start:start + microbatch].to(
+                        self.device, non_blocking=True).long()
+                    with torch.cuda.amp.autocast(enabled=self._use_amp):
+                        output = self._logits(self.model(data))
+                        # Preserve the full-batch gradient scale.
+                        loss = self.criterion(output, target)
+                        loss = loss * (target.numel() / float(len(cpu_data)))
+                    self._scaler.scale(loss).backward()
+                    correct += (
+                        output.detach().argmax(1) == target).sum().item()
+                    seen += target.numel()
+                self._scaler.step(self.optimizer)
+                self._scaler.update()
+                return correct, seen
+            except RuntimeError as error:
+                if ("out of memory" not in str(error).lower() or
+                        microbatch == 1):
+                    raise
+                self.optimizer.zero_grad(set_to_none=True)
+                microbatch = max(1, microbatch // 2)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print("  OOM recovery: training microbatch={}".format(
+                    microbatch))
+        return 0, 0
 
     def _try_runner_ups(self, epoch_seconds, reserve):
         """
@@ -242,6 +311,17 @@ class Trainer:
                 self.model = challenger
                 self._best_accuracy = challenger_acc
                 incumbent_accuracy = challenger_acc
+            elif (challenger_acc is not None and
+                  challenger_acc >= incumbent_accuracy - 0.01 and
+                  self._time_left() > reserve + 120):
+                # A close, architecturally distinct challenger can reduce hidden
+                # test variance. Keep at most one to control prediction cost.
+                if not self._ensemble_models:
+                    challenger.eval()
+                    self._ensemble_models.append(challenger)
+                    print("    Retaining close challenger for 2-model ensemble")
+                else:
+                    del challenger
             else:
                 acc_str = f"{100*challenger_acc:.2f}%" if challenger_acc else "N/A"
                 print(f"    Incumbent holds: {acc_str} <= "
@@ -347,13 +427,68 @@ class Trainer:
         self.model.to(self.device)
         self.model.eval()
         predictions = []
+        models = [self.model] + list(self._ensemble_models)
+        for candidate in models:
+            candidate.to(self.device)
+            candidate.eval()
+        started = time.perf_counter()
+        processed = 0
         with torch.no_grad():
             for batch in test_loader:
                 # Be tolerant of a test dataset that returns (image,) rather than
                 # a bare tensor, while preserving sample order.
                 data = batch[0] if isinstance(batch, (tuple, list)) else batch
-                data = data.to(self.device, non_blocking=True)
-                with torch.cuda.amp.autocast(enabled=self._use_amp):
-                    output = self._logits(self.model(data))
-                predictions.extend(output.argmax(1).cpu().tolist())
+                try:
+                    data = data.to(self.device, non_blocking=True)
+                    with torch.cuda.amp.autocast(enabled=self._use_amp):
+                        logits = [self._logits(candidate(data))
+                                  for candidate in models]
+                        output = sum(logits) / float(len(logits))
+                except RuntimeError as error:
+                    if ("out of memory" not in str(error).lower() or
+                            len(data) <= 1):
+                        raise
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    output = self._predict_in_chunks(models, data.cpu())
+                predicted_indices = output.argmax(1).cpu().tolist()
+                label_values = self.metadata.get("label_values")
+                if label_values is None:
+                    predictions.extend(predicted_indices)
+                else:
+                    predictions.extend(
+                        label_values[index] for index in predicted_indices)
+                processed += len(data)
+                # If the ensemble makes the measured prediction estimate unsafe,
+                # discard it for all remaining batches.
+                elapsed = time.perf_counter() - started
+                if (len(models) > 1 and processed > 0 and
+                        self._time_left() <
+                        1.5 * elapsed * max(
+                            0.0, self.metadata.get("test_size", processed) /
+                            float(processed) - 1.0) + 30.0):
+                    models = models[:1]
+                    print("  Prediction safety: disabling ensemble")
         return predictions
+
+    def _predict_in_chunks(self, models, cpu_data):
+        """Recursively reduce prediction microbatch size after an OOM."""
+        if len(cpu_data) <= 1:
+            data = cpu_data.to(self.device)
+            return sum(self._logits(model(data)) for model in models) / float(
+                len(models))
+        midpoint = len(cpu_data) // 2
+        outputs = []
+        for chunk in (cpu_data[:midpoint], cpu_data[midpoint:]):
+            try:
+                data = chunk.to(self.device)
+                with torch.cuda.amp.autocast(enabled=self._use_amp):
+                    output = sum(self._logits(model(data)) for model in models)
+                    outputs.append(output / float(len(models)))
+            except RuntimeError as error:
+                if "out of memory" not in str(error).lower():
+                    raise
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                outputs.append(self._predict_in_chunks(models, chunk))
+        return torch.cat(outputs, dim=0)
