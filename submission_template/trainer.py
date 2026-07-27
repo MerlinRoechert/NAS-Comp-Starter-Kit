@@ -199,8 +199,8 @@ class Trainer:
                 epoch + 1, self.max_epochs, 100.0 * train_accuracy,
                 "{:>6.2f}%".format(100.0 * valid_accuracy)
                 if valid_accuracy is not None else "skipped", epoch_seconds))
-            patience = 12 if len(self.train_dataloader) < 100 else 7
-            if (epoch >= 10 and
+            patience = 30
+            if (epoch >= 30 and
                     self._epochs_without_improvement >= patience):
                 print("  Early stopping after {} stale epochs".format(
                     self._epochs_without_improvement))
