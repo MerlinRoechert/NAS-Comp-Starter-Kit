@@ -18,6 +18,45 @@ def add_channel_dimension(images):
     return images
 
 
+def dataset_diagnostics(images, labels, num_classes):
+    """Cheap, codename-independent statistics for hidden-dataset decisions."""
+    sample = np.asarray(images[:min(len(images), 1024)])
+    finite = np.isfinite(sample)
+    finite_values = sample[finite]
+    if finite_values.size:
+        value_min = float(np.min(finite_values))
+        value_max = float(np.max(finite_values))
+        value_std = float(np.std(finite_values, dtype=np.float64))
+        unique_values = int(len(np.unique(finite_values[:min(
+            finite_values.size, 250000)])))
+    else:
+        value_min = value_max = value_std = 0.0
+        unique_values = 0
+    labels_array = np.asarray(labels).reshape(-1)
+    _, counts = np.unique(labels_array, return_counts=True)
+    imbalance = (float(counts.max()) / max(1.0, float(counts.min()))
+                 if counts.size else 1.0)
+    height, width = images.shape[-2:]
+    # Few discrete values are a strong signal for boards, glyphs, masks and
+    # other encoded inputs where spatial corruption is dangerous.
+    encoded_likely = unique_values <= 32 or value_std == 0.0
+    return {
+        "n_train": int(len(images)),
+        "channels": int(images.shape[1]),
+        "height": int(height),
+        "width": int(width),
+        "spatial_size": int(height * width),
+        "num_classes": int(num_classes),
+        "value_min": value_min,
+        "value_max": value_max,
+        "value_std": value_std,
+        "sample_unique_values": unique_values,
+        "nonfinite_fraction": float(1.0 - finite.mean()) if finite.size else 0.0,
+        "class_imbalance_ratio": imbalance,
+        "encoded_likely": bool(encoded_likely),
+    }
+
+
 class Dataset(TorchDataset):
     def __init__(
         self,
@@ -46,7 +85,10 @@ class Dataset(TorchDataset):
         return len(self.x)
 
     def __getitem__(self, index):
-        image = torch.as_tensor(self.x[index], dtype=torch.float32)
+        # torch.tensor intentionally copies a possibly read-only memmap slice.
+        # This avoids undefined behaviour warnings in offline calibration.
+        image = torch.tensor(self.x[index], dtype=torch.float32)
+        image = torch.where(torch.isfinite(image), image, self.mean)
 
         augmentation = self._select_augmentation(image)
 
@@ -170,22 +212,69 @@ class DataProcessor:
     """
     def __init__(self, train_x, train_y, valid_x, valid_y, test_x, metadata, clock):
         self.train_x = add_channel_dimension(train_x)
-        self.train_y = train_y
+        label_values = np.unique(np.asarray(train_y).reshape(-1))
+        num_classes = int(metadata["num_classes"])
+        integer_labels = np.asarray(train_y).dtype.kind in "iub"
+        conventional = (
+            integer_labels and len(label_values) > 0 and
+            int(label_values.min()) >= 0 and
+            int(label_values.max()) < num_classes
+        )
+        if conventional:
+            # Preserve the organizer's class indices even when a rare class is
+            # absent from the training split.
+            label_values = np.arange(num_classes)
+        elif len(label_values) != num_classes:
+            raise ValueError(
+                "cannot map {} observed labels to metadata num_classes={}"
+                .format(len(label_values), num_classes))
+        label_map = {
+            value.item() if hasattr(value, "item") else value: index
+            for index, value in enumerate(label_values)
+        }
+        self.train_y = np.asarray([
+            label_map[value.item() if hasattr(value, "item") else value]
+            for value in np.asarray(train_y).reshape(-1)], dtype=np.int64)
         self.valid_x = add_channel_dimension(valid_x)
-        self.valid_y = valid_y
+        try:
+            self.valid_y = np.asarray([
+                label_map[value.item() if hasattr(value, "item") else value]
+                for value in np.asarray(valid_y).reshape(-1)], dtype=np.int64)
+        except KeyError as error:
+            raise ValueError(
+                "validation contains a label absent from training: {}"
+                .format(error))
         self.test_x = add_channel_dimension(test_x)
         self.metadata = metadata
+        self.metadata["label_values"] = [
+            value.item() if hasattr(value, "item") else value
+            for value in label_values
+        ]
         self.clock = clock
 
         self.seed = 42
         self.metadata["seed"] = self.seed
+        self.diagnostics = dataset_diagnostics(
+            self.train_x, self.train_y, metadata["num_classes"])
+        self.metadata["diagnostics"] = self.diagnostics
 
-        self.augmentations = [
-            AugmentationType.TRANSLATION,
-            AugmentationType.PIXEL_NOISE,
-            AugmentationType.OCCLUSION,
+        if self.diagnostics["encoded_likely"]:
+            self.augmentations = []
+            self.augmentation_probability = 0.0
+        else:
+            # Noise and small occlusions do not assume orientation. Translation
+            # is reserved for larger, continuous-valued imagery.
+            self.augmentations = [
+                AugmentationType.PIXEL_NOISE,
+                AugmentationType.OCCLUSION,
+            ]
+            if self.diagnostics["spatial_size"] >= 1024:
+                self.augmentations.append(AugmentationType.TRANSLATION)
+            self.augmentation_probability = 0.30
+        self.metadata["augmentation_policy"] = [
+            augmentation.value for augmentation in self.augmentations
         ]
-        self.augmentation_probability = 0.5
+        self.metadata["augmentation_probability"] = self.augmentation_probability
         self.augmentation_value_range = None
 
         if AugmentationType.RGB in self.augmentations:
@@ -208,9 +297,18 @@ class DataProcessor:
     Here, you can do whatever you want to the input data to process it for your NAS algorithm and training functions
     """
     def process(self):
-        mean = np.mean(self.train_x, axis=(0, 2, 3), dtype=np.float64).astype(np.float32)
-        std = np.std(self.train_x, axis=(0, 2, 3), dtype=np.float64).astype(np.float32)
-        std = np.maximum(std, np.finfo(np.float32).eps)
+        # Limit the temporary float64 workset: full arrays can be many GiB.
+        stats_sample = np.asarray(
+            self.train_x[:min(len(self.train_x), 4096)], dtype=np.float64)
+        stats_sample[~np.isfinite(stats_sample)] = np.nan
+        mean = np.nanmean(stats_sample, axis=(0, 2, 3),
+                          dtype=np.float64).astype(np.float32)
+        std = np.nanstd(stats_sample, axis=(0, 2, 3),
+                        dtype=np.float64).astype(np.float32)
+        mean = np.nan_to_num(mean, nan=0.0)
+        # A unit scale is safer than epsilon for constant channels: an unseen
+        # nonconstant validation value cannot explode to 1e38.
+        std = np.where(np.isfinite(std) & (std > 1e-6), std, 1.0).astype(np.float32)
 
         augmentation_generator = torch.Generator()
         augmentation_generator.manual_seed(self.seed + 1)
@@ -234,6 +332,16 @@ class DataProcessor:
         batch_size = choose_batch_size(self.train_x.shape, hardware)
         self.metadata["hardware"] = hardware
         self.metadata["batch_size"] = batch_size
+        self.metadata["train_size"] = int(len(self.train_x))
+        self.metadata["valid_size"] = int(len(self.valid_x))
+        self.metadata["test_size"] = int(len(self.test_x))
+        print("  Diagnostics: encoded={}, unique~{}, imbalance={:.2f}, "
+              "nonfinite={:.3%}, augmentation={}".format(
+                  self.diagnostics["encoded_likely"],
+                  self.diagnostics["sample_unique_values"],
+                  self.diagnostics["class_imbalance_ratio"],
+                  self.diagnostics["nonfinite_fraction"],
+                  self.metadata["augmentation_policy"] or "none"))
 
         generator = torch.Generator()
         generator.manual_seed(self.seed)
