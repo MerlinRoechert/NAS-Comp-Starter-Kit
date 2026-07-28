@@ -37,9 +37,31 @@ def dataset_diagnostics(images, labels, num_classes):
     imbalance = (float(counts.max()) / max(1.0, float(counts.min()))
                  if counts.size else 1.0)
     height, width = images.shape[-2:]
+    occupancy = 0.0
+    column_one_hot_fraction = 0.0
+    row_one_hot_fraction = 0.0
+    if finite_values.size and sample.ndim == 4:
+        values, value_counts = np.unique(finite_values, return_counts=True)
+        background = values[int(np.argmax(value_counts))]
+        active = finite & (sample != background)
+        occupancy = float(active.mean())
+        column_counts = active.sum(axis=(1, 2))
+        column_one_hot_fraction = float(np.mean(column_counts == 1))
+        row_counts = active.sum(axis=(1, 3))
+        row_one_hot_fraction = float(np.mean(row_counts == 1))
+    positional_one_hot_fraction = max(
+        row_one_hot_fraction, column_one_hot_fraction)
     # Few discrete values are a strong signal for boards, glyphs, masks and
     # other encoded inputs where spatial corruption is dangerous.
     encoded_likely = unique_values <= 32 or value_std == 0.0
+    sequence_grid_likely = (
+        encoded_likely
+        and images.shape[1] == 1
+        and unique_values <= 4
+        and 0.0 < occupancy <= 0.15
+        and positional_one_hot_fraction >= 0.80
+        and min(height, width) >= 8
+    )
     return {
         "n_train": int(len(images)),
         "channels": int(images.shape[1]),
@@ -54,6 +76,11 @@ def dataset_diagnostics(images, labels, num_classes):
         "nonfinite_fraction": float(1.0 - finite.mean()) if finite.size else 0.0,
         "class_imbalance_ratio": imbalance,
         "encoded_likely": bool(encoded_likely),
+        "occupancy": occupancy,
+        "column_one_hot_fraction": column_one_hot_fraction,
+        "row_one_hot_fraction": row_one_hot_fraction,
+        "positional_one_hot_fraction": positional_one_hot_fraction,
+        "sequence_grid_likely": bool(sequence_grid_likely),
     }
 
 
@@ -361,10 +388,14 @@ class DataProcessor:
         self.metadata["train_size"] = int(len(self.train_x))
         self.metadata["valid_size"] = int(len(self.valid_x))
         self.metadata["test_size"] = int(len(self.test_x))
-        print("  Diagnostics: encoded={}, unique~{}, imbalance={:.2f}, "
+        print("  Diagnostics: encoded={}, sequence_grid={}, unique~{}, "
+              "occupancy={:.2%}, positional_one_hot={:.2%}, imbalance={:.2f}, "
               "nonfinite={:.3%}, augmentation={}".format(
                   self.diagnostics["encoded_likely"],
+                  self.diagnostics["sequence_grid_likely"],
                   self.diagnostics["sample_unique_values"],
+                  self.diagnostics["occupancy"],
+                  self.diagnostics["positional_one_hot_fraction"],
                   self.diagnostics["class_imbalance_ratio"],
                   self.diagnostics["nonfinite_fraction"],
                   self.metadata["augmentation_policy"] or "none"))
