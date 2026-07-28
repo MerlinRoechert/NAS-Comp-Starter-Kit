@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-repository="/bigwork/nhwproem/NAS-Comp-Starter-Kit"
-virtualenv="${repository}/venv"
+repository="${NAS_BO_REPOSITORY:-/bigwork/nhwproem/NAS-Comp-Starter-Kit}"
+virtualenv="${NAS_BO_VENV:-${repository}/venv}"
 
 if [[ ! -d "${repository}" ]]; then
     echo "Repository not found: ${repository}" >&2
