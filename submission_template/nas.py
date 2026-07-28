@@ -79,7 +79,7 @@ class NAS:
 
     def _load_proxy_weights(self):
         """Use calibration output when it has been copied into the submission."""
-        weights = {"naswot": 0.5, "synflow": 0.5}
+        weights = {"naswot": 0.05, "synflow": 0.95}
         path = os.path.join(os.path.dirname(__file__), "proxy_weights.json")
         try:
             with open(path, "r") as handle:
