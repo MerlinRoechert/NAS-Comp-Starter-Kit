@@ -326,7 +326,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--slurm-walltime", default="03:00:00")
     parser.add_argument(
         "--slurm-conda-env",
-        help="Conda environment available on every worker (required with --luh-slurm).")
+        help="Conda environment available on every worker.")
+    parser.add_argument(
+        "--slurm-venv",
+        help="Absolute virtualenv path available on every worker.")
     return parser.parse_args()
 
 
@@ -339,8 +342,10 @@ def main() -> None:
     if args.scheduler_address and args.luh_slurm:
         raise ValueError(
             "--scheduler-address and --luh-slurm are mutually exclusive")
-    if args.luh_slurm and not args.slurm_conda_env:
-        raise ValueError("--slurm-conda-env is required with --luh-slurm")
+    if args.luh_slurm and bool(args.slurm_conda_env) == bool(args.slurm_venv):
+        raise ValueError(
+            "with --luh-slurm, provide exactly one of "
+            "--slurm-conda-env or --slurm-venv")
     root = Path(args.datasets_root).resolve()
     datasets = _dataset_dirs(root, args.datasets)
     cs = configuration_space(args.seed)
@@ -358,6 +363,17 @@ def main() -> None:
 
         logs = output / "slurm-logs"
         logs.mkdir(parents=True, exist_ok=True)
+        if args.slurm_venv:
+            environment_prologue = [
+                "module load GCCcore/.13.2.0 Python/3.11.5 CUDA/11.8.0",
+                "source {}/bin/activate".format(
+                    Path(args.slurm_venv).resolve()),
+            ]
+        else:
+            environment_prologue = [
+                "module load Miniforge3",
+                "conda activate {}".format(args.slurm_conda_env),
+            ]
         cluster = SLURMCluster(
             queue=args.slurm_partition,
             cores=args.slurm_cpus,
@@ -372,9 +388,7 @@ def main() -> None:
                 "--output={}/%x_%j.out".format(logs),
                 "--error={}/%x_%j.err".format(logs),
             ],
-            job_script_prologue=[
-                "module load Miniforge3",
-                "conda activate {}".format(args.slurm_conda_env),
+            job_script_prologue=environment_prologue + [
                 "cd {}".format(Path.cwd().resolve()),
             ],
         )
