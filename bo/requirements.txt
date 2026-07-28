@@ -1,0 +1,6 @@
+smac>=2.2,<3
+ConfigSpace>=1.2,<2
+distributed>=2024.1
+scikit-learn>=1.6.1,<1.8
+# Install only if LUH uses Slurm and you want Dask to create Slurm jobs:
+# dask-jobqueue>=0.9

@@ -53,6 +53,13 @@ class NAS:
 
         # Search space parameters — adapted to dataset complexity
         self._configure_search_space()
+        bo_config = metadata.get("bo_config", {})
+        if "n_cells" in bo_config:
+            self.cell_counts = [int(bo_config["n_cells"])]
+        if "init_channels" in bo_config:
+            self.init_channels_options = [int(bo_config["init_channels"])]
+        if "dropout" in bo_config:
+            self.dropout_rate = float(bo_config["dropout"])
         self.proxy_weights = self._load_proxy_weights()
 
     def _time_left(self):

@@ -246,21 +246,42 @@ class DataProcessor:
                 .format(error))
         self.test_x = add_channel_dimension(test_x)
         self.metadata = metadata
+        self.bo_config = dict(metadata.get("bo_config", {}))
         self.metadata["label_values"] = [
             value.item() if hasattr(value, "item") else value
             for value in label_values
         ]
         self.clock = clock
 
-        self.seed = 42
+        self.seed = int(metadata.get("seed", 42))
         self.metadata["seed"] = self.seed
         self.diagnostics = dataset_diagnostics(
             self.train_x, self.train_y, metadata["num_classes"])
         self.metadata["diagnostics"] = self.diagnostics
 
+        augmentation_mode = self.bo_config.get("augmentation_mode")
         if self.diagnostics["encoded_likely"]:
             self.augmentations = []
             self.augmentation_probability = 0.0
+        elif augmentation_mode is not None:
+            policies = {
+                "none": [],
+                "noise": [AugmentationType.PIXEL_NOISE],
+                "occlusion": [AugmentationType.OCCLUSION],
+                "noise+occlusion": [
+                    AugmentationType.PIXEL_NOISE,
+                    AugmentationType.OCCLUSION,
+                ],
+            }
+            if augmentation_mode not in policies:
+                raise ValueError(
+                    "unsupported BO augmentation mode: {}".format(
+                        augmentation_mode))
+            self.augmentations = policies[augmentation_mode]
+            self.augmentation_probability = (
+                0.0 if not self.augmentations else
+                float(self.bo_config.get("augmentation_probability", 0.30))
+            )
         else:
             # Noise and small occlusions do not assume orientation. Translation
             # is reserved for larger, continuous-valued imagery.
@@ -329,7 +350,12 @@ class DataProcessor:
         test_dataset = Dataset(self.test_x, None, mean, std)
 
         hardware = get_hardware_info()
-        batch_size = choose_batch_size(self.train_x.shape, hardware)
+        safe_batch_size = choose_batch_size(self.train_x.shape, hardware)
+        requested_batch_size = self.bo_config.get("batch_size")
+        batch_size = (
+            min(int(requested_batch_size), safe_batch_size)
+            if requested_batch_size is not None else safe_batch_size
+        )
         self.metadata["hardware"] = hardware
         self.metadata["batch_size"] = batch_size
         self.metadata["train_size"] = int(len(self.train_x))

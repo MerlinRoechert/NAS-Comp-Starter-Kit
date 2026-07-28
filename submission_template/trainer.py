@@ -26,11 +26,14 @@ class Trainer:
         self.valid_dataloader = valid_dataloader
         self.metadata = metadata
         self.clock = clock
+        self.bo_config = dict(metadata.get("bo_config", {}))
 
         batch_size = getattr(train_dataloader, "batch_size", None) or 64
         # Linear scaling is useful, but clipping prevents surprising loaders from
         # producing an excessively large learning rate.
         self.learning_rate = min(0.2, max(0.01, 0.05 * batch_size / 128.0))
+        if "learning_rate" in self.bo_config:
+            self.learning_rate = float(self.bo_config["learning_rate"])
         self.max_epochs = self._epoch_cap()
         self.criterion = self._make_criterion()
 
@@ -46,6 +49,8 @@ class Trainer:
             wd = 2e-3  # strong regularization for simple/overfit-prone tasks
         else:
             wd = 5e-4  # standard
+        if "weight_decay" in self.bo_config:
+            wd = float(self.bo_config["weight_decay"])
 
         self.optimizer = torch.optim.SGD(
             self.model.parameters(), lr=self.learning_rate, momentum=0.9,
@@ -84,15 +89,25 @@ class Trainer:
         # Mild label smoothing is a robust regularizer on unknown image tasks.
         # Retain compatibility with older PyTorch installations.
         diagnostics = self.metadata.get("diagnostics", {})
-        smoothing = 0.05 if diagnostics.get("encoded_likely") else 0.1
+        smoothing = float(self.bo_config.get(
+            "label_smoothing",
+            0.05 if diagnostics.get("encoded_likely") else 0.1))
         weights = None
         labels = getattr(getattr(self.train_dataloader, "dataset", None),
                          "y", None)
-        if labels is not None and diagnostics.get("class_imbalance_ratio", 1.0) >= 3:
+        weighting = self.bo_config.get("class_weighting", "inverse")
+        threshold = float(self.bo_config.get("class_weighting_threshold", 3.0))
+        if (labels is not None and weighting != "none" and
+                diagnostics.get("class_imbalance_ratio", 1.0) >= threshold):
             labels = torch.as_tensor(labels, dtype=torch.long)
             counts = torch.bincount(
                 labels, minlength=int(self.metadata["num_classes"])).float()
             weights = counts.sum() / counts.clamp_min(1.0)
+            if weighting == "inverse_sqrt":
+                weights = weights.sqrt()
+            elif weighting != "inverse":
+                raise ValueError(
+                    "unsupported class weighting mode: {}".format(weighting))
             weights = weights / weights.mean()
         try:
             return nn.CrossEntropyLoss(
@@ -111,6 +126,8 @@ class Trainer:
 
     def _save_checkpoint(self):
         """Persist the incumbent as a second line of defence against failures."""
+        if self.metadata.get("disable_checkpoint", False):
+            return
         try:
             directory = os.path.dirname(self._checkpoint_path)
             if directory and not os.path.isdir(directory):

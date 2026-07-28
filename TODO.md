@@ -1,124 +1,175 @@
-1. Run Proxy Score Ablation Study / Weighting of normalized SynFlow/NASWOT sum
+# Team guide: proxy calibration and BO
 
-2. Improve based on results of previous runs and Proxy Score result
+Run commands from the repository root. Use visible development validation
+labels only—never test labels. Replace all example dataset names and
+`/bigwork/PROJECT/...` paths before submitting jobs.
 
-3. Run some kind of HPO or try different HP's, interesting candidates to tune:
-For an unseen-data challenge, I would prioritize hyperparameters that adapt to cheap dataset diagnostics and avoid aggressive semantic assumptions. Augmentation should be
-  conservative and conditional—not treated like an ordinary image-classification benchmark.
+## 1. Prepare once
 
-  My recommended top 10 are:
+The repository and datasets must be available at the same shared paths on all
+workers. Each dataset needs `metadata`, train/validation arrays, and
+`test_x.npy`.
 
-  1. Base learning rate
+Use a Python 3.11/3.12 environment containing the competition dependencies and
+the BO dependencies:
 
-     Probably the most important training HP. It is currently coupled to batch size.
+```bash
+module load Miniforge3
+conda activate nas_bo
+python -m pip install -r bo/requirements.txt
+python -c "import torch, smac, ConfigSpace, distributed; print(torch.cuda.is_available())"
+python -m unittest proxy_calibration/test_hail_mary.py
+```
 
-     Suggested space: log-uniform 0.005–0.15, or tune the coefficient in the current scaling rule.
+`torch.cuda.is_available()` should be `True` inside a GPU allocation.
 
-     Location: submission_template/trainer.py:30
+## 2. Calibrate NASWOT and SynFlow
 
-  2. Weight decay
+Calibration compares proxy rankings with equal-update short-training rankings
+on several development datasets.
 
-     Crucial for balancing underfitting and overfitting across unknown dataset sizes and model capacities.
+First run a smoke test in a separate output directory:
 
-     Suggested space: log-uniform 1e-5–5e-3.
+```bash
+python proxy_calibration/calibrate.py \
+  --datasets datasets/dataset_a datasets/dataset_b \
+  --candidates 5 \
+  --updates 5 \
+  --output proxy_calibration/smoke/results.json
+```
 
-     Location: submission_template/trainer.py:37
+Do not adopt smoke-test weights. The useful experiment is:
 
-  3. Initial channel width
+```bash
+python proxy_calibration/calibrate.py \
+  --datasets \
+    datasets/dataset_a \
+    datasets/dataset_b \
+    datasets/dataset_c \
+    datasets/dataset_d \
+    datasets/dataset_e \
+  --candidates 30 \
+  --updates 100 \
+  --proxy-batch 24 \
+  --seed 42 \
+  --output proxy_calibration/results.json
+```
 
-     This is the strongest direct control over model capacity, memory consumption, and speed.
+Run this on one LUH A100 using the same Slurm header as the BO workers:
 
-     Suggested choices: {16, 24, 32, 48, 64}, constrained by dataset size and resolution.
+```bash
+#SBATCH --partition=ai
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=2
+#SBATCH --gres=gpu:a100:1
+#SBATCH --mem=16G
+#SBATCH --time=3:00:00
+```
 
-     Location: submission_template/nas.py:104
+Inspect:
 
-  4. Number of cells
+```bash
+python -m json.tool proxy_calibration/proxy_weights.json
+```
 
-     Controls depth and interacts strongly with width. Tune width and depth jointly because a deep-wide network can consume the budget before converging.
+Adopt a weighting only when correlations are positive and reasonably stable
+across individual and leave-one-dataset-out results:
 
-     Suggested choices: {2, 3, 4, 5, 6}.
+```bash
+cp proxy_calibration/proxy_weights.json \
+  submission_template/proxy_weights.json
+```
 
-     Location: submission_template/nas.py:104
+If correlations are near zero, negative, or dataset-dependent, retain the
+default weighting and rely on equal-budget finalist training.
 
-  5. Dropout rate
+## 3. Run the 100-trial BO
 
-     Useful for unseen tasks because the appropriate model capacity is uncertain. It should depend on the sample count and model size.
+The study uses:
 
-     Suggested space: 0.0–0.4, with lower values for large datasets and underfitting-prone configurations.
+- 25 Sobol space-filling initial configurations;
+- 75 model-guided SMAC configurations;
+- up to 25 asynchronous one-A100 workers;
+- a small mixed-space diversity filter against the 25 most recent proposals;
+- mean validation adjusted score across the selected datasets.
 
-     Location: submission_template/nas.py:109
+The diversity filter rejects near-duplicates below normalized distance `0.08`.
+It never modifies the initial Sobol design and has a retry escape to avoid
+stalling.
 
-  6. Label smoothing
+### One-worker smoke test
 
-     Usually safer than geometry-based augmentation because it does not modify the input. Nevertheless, too much smoothing can hurt fine-grained or noisy-label tasks.
+```bash
+python -m bo.run_smac \
+  --trials 1 \
+  --initial-sobol 1 \
+  --workers 1 \
+  --budget-minutes 2 \
+  --train-limit 1024 \
+  --datasets dataset_a \
+  --luh-slurm \
+  --slurm-conda-env nas_bo \
+  --output bo/smoke-output
+```
 
-     Suggested choices: {0.0, 0.025, 0.05, 0.1}.
+Confirm that the worker finishes and `bo/smoke-output/incumbent.json` exists.
+Do not request 25 workers until this passes.
 
-     Location: submission_template/trainer.py:83
+### Full run
 
-  7. Augmentation gate and probability
+```bash
+python -m bo.run_smac \
+  --trials 100 \
+  --initial-sobol 25 \
+  --workers 25 \
+  --budget-minutes 15 \
+  --datasets dataset_a dataset_b dataset_c \
+  --luh-slurm \
+  --slurm-partition ai \
+  --slurm-gpu a100 \
+  --slurm-cpus 2 \
+  --slurm-memory 16GiB \
+  --slurm-walltime 03:00:00 \
+  --slurm-conda-env nas_bo \
+  --output bo/output
+```
 
-     Treat this as one conditional HP:
+Alternatively, submit the coordinator:
 
-     augmentation mode ∈ {none, noise, occlusion, noise+occlusion}
-     probability ∈ [0.0, 0.3]
+```bash
+export NAS_BO_REPOSITORY=/bigwork/PROJECT/path/NAS-Comp-Starter-Kit
+export NAS_BO_CONDA_ENV=nas_bo
+export NAS_BO_DATASETS="dataset_a dataset_b dataset_c"
+export NAS_BO_BUDGET_MINUTES=15
+sbatch bo/submit_luh_coordinator.sh
+```
 
-     I would keep translation, rotation, flips, and color transformations disabled unless diagnostics provide strong evidence that they preserve the label. Vertical flips
-     are especially dangerous for digits, characters, medical data, directional objects, and encoded arrays.
+Approximate compute usage is:
 
-     The current encoded_likely → no augmentation gate is sensible, but the threshold defining encoded data may also need calibration.
+```text
+trials × datasets × minutes / 60
+```
 
-     Location: submission_template/data_processor.py:261
+Thus, 100 trials × 3 datasets × 15 minutes is approximately 75 GPU-hours.
 
-  8. Batch size
+Monitor with:
 
-     Batch size affects optimization, learning-rate scaling, memory, and the number of updates possible within the time budget.
+```bash
+squeue -u "$USER"
+find bo/output/slurm-logs -maxdepth 1 -type f -print
+```
 
-     Suggested choices: {16, 32, 64}, with 128 only when images are small and memory permits.
+The result is `bo/output/incumbent.json`. Treat it as a candidate: compare it
+against the current incumbent at full budget, on every development dataset,
+and with additional seeds before changing submission defaults.
 
-     Heuristic: submission_template/helpers.py:760
+## 4. Record for every run
 
-  9. Short-training fidelity
-
-     This includes the number of updates and validation examples used to select finalists. If the fidelity is too low, the search may consistently select architectures that
-     learn quickly but finish poorly.
-
-     Most important components:
-      - Maximum updates: currently 40
-      - Short-training learning rate: currently 0.03
-      - Validation subset: currently 1,024 examples
-      - Total finalist-training budget
-
-     Location: submission_template/nas.py:325
-
-  10. Class-imbalance weighting policy
-
-  This is particularly relevant for unseen datasets. The current code activates inverse-frequency weights at an imbalance ratio of 3, but full inverse-frequency weighting
-  can overcorrect severely.
-
-  Suggested conditional choices:
-
-     weighting ∈ {none, inverse-sqrt frequency, inverse frequency}
-     activation threshold ∈ {2, 3, 5, 10}
-
-  I would expect inverse-square-root weighting to be safer across unknown datasets.
-
-  Location: submission_template/trainer.py:91
-
-  A compact first BO space could therefore be:
-
-  learning_rate          loguniform(0.005, 0.15)
-  weight_decay           loguniform(1e-5, 5e-3)
-  init_channels          {16, 24, 32, 48, 64}
-  n_cells                {2, 3, 4, 5, 6}
-  dropout                uniform(0.0, 0.4)
-  label_smoothing        {0.0, 0.025, 0.05, 0.1}
-  augmentation_mode      {none, noise, occlusion, noise+occlusion}
-  augmentation_prob      uniform(0.0, 0.3), conditional
-  batch_size             {16, 32, 64}
-  class_weighting        {none, inverse_sqrt, inverse}
-
-  I would initially hold the cell topology, proxy weighting, candidate count, and diversity coefficient fixed. Otherwise BO must optimize architecture, training, and search
-  reliability simultaneously, which makes the observed validation score substantially noisier. After finding a robust training policy, architecture-search parameters can
-  form a second optimization stage.
-
+- Git commit hash and person launching
+- Dataset list and seed
+- Environment and Slurm job ID
+- Candidate/trial count and budget
+- Output directory
+- Per-dataset scores, failures, OOMs, and runtime
+- Final decision: adopt, reject, or rerun
