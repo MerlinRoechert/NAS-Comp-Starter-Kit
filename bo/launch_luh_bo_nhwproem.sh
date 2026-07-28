@@ -3,13 +3,14 @@
 set -euo pipefail
 
 repository="${NAS_BO_REPOSITORY:-/bigwork/nhwproem/NAS-Comp-Starter-Kit}"
-virtualenv="${NAS_BO_VENV:-${repository}/venv}"
+virtualenv="${NAS_BO_VENV:-}"
+conda_environment="${NAS_BO_CONDA_ENV:-nas_bo}"
 
 if [[ ! -d "${repository}" ]]; then
     echo "Repository not found: ${repository}" >&2
     exit 2
 fi
-if [[ ! -f "${virtualenv}/bin/activate" ]]; then
+if [[ -n "${virtualenv}" && ! -f "${virtualenv}/bin/activate" ]]; then
     echo "Virtual environment not found: ${virtualenv}" >&2
     exit 2
 fi
@@ -31,11 +32,21 @@ if [[ -z "${dataset_names}" ]]; then
 fi
 
 export NAS_BO_REPOSITORY="${repository}"
-export NAS_BO_VENV="${virtualenv}"
 export NAS_BO_DATASETS="${dataset_names}"
 export NAS_BO_BUDGET_MINUTES="${NAS_BO_BUDGET_MINUTES:-15}"
 
-source "${NAS_BO_VENV}/bin/activate"
+if [[ -n "${virtualenv}" ]]; then
+    export NAS_BO_VENV="${virtualenv}"
+    unset NAS_BO_CONDA_ENV
+    source "${NAS_BO_VENV}/bin/activate"
+    environment_description="venv ${NAS_BO_VENV}"
+else
+    unset NAS_BO_VENV
+    export NAS_BO_CONDA_ENV="${conda_environment}"
+    module load Miniforge3
+    conda activate "${NAS_BO_CONDA_ENV}"
+    environment_description="Conda ${NAS_BO_CONDA_ENV}"
+fi
 
 python -c \
     "import torch, smac, ConfigSpace, distributed, dask_jobqueue; print('CUDA build:', torch.version.cuda)"
@@ -43,7 +54,7 @@ python -c \
 mkdir -p bo/output bo/output/slurm-logs
 
 echo "Repository: ${NAS_BO_REPOSITORY}"
-echo "Virtualenv:  ${NAS_BO_VENV}"
+echo "Environment: ${environment_description}"
 echo "Datasets:    ${NAS_BO_DATASETS}"
 echo "Budget:      ${NAS_BO_BUDGET_MINUTES} minutes per dataset"
 
