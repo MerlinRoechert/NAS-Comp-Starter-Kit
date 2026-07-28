@@ -28,6 +28,10 @@ if [[ -z "${NAS_BO_DATASETS:-}" ]]; then
     echo "Set NAS_BO_DATASETS to a space-separated dataset list." >&2
     exit 2
 fi
+if [[ -z "${NAS_BO_DATASETS_ROOT:-}" ]]; then
+    echo "Set NAS_BO_DATASETS_ROOT to the shared dataset directory." >&2
+    exit 2
+fi
 
 worker_environment_args=()
 if [[ -n "${NAS_BO_VENV:-}" ]]; then
@@ -49,6 +53,7 @@ python -m bo.run_smac \
     --initial-sobol 25 \
     --workers 25 \
     --budget-minutes "${NAS_BO_BUDGET_MINUTES:-15}" \
+    --datasets-root "${NAS_BO_DATASETS_ROOT}" \
     --datasets "${dataset_names[@]}" \
     --luh-slurm \
     --slurm-partition ai \
