@@ -196,7 +196,7 @@ class NAS:
         search_deadline = max(15.0, min(
             self.time_remaining * 0.12,
             max(15.0, self._time_left() - self._prediction_reserve() - 60.0)))
-        rng = random.Random(42)
+        rng = random.Random(self.master_seed)
 
         # ==================================================================
         # PHASE 1: Sample candidates and score with training-free proxies
