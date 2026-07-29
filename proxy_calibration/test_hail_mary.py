@@ -12,7 +12,6 @@ sys.path.insert(0, str(ROOT / "submission_template"))
 from data_processor import DataProcessor, dataset_diagnostics  # noqa: E402
 from helpers import (  # noqa: E402
     architecture_descriptor,
-    build_model_from_config,
     descriptor_distance,
     diversity_summary,
     robust_normalize,
@@ -70,36 +69,6 @@ class HailMaryTests(unittest.TestCase):
         x[0, 0, 0, 0] = np.nan
         diagnostics = dataset_diagnostics(x, [0, 1, 0, 1], 2)
         self.assertGreater(diagnostics["nonfinite_fraction"], 0.0)
-
-    def test_sequence_grid_preserves_position(self):
-        rng = np.random.RandomState(42)
-        x = np.zeros((16, 1, 24, 24), dtype=np.float32)
-        columns = np.arange(24)
-        for index in range(len(x)):
-            x[index, 0, rng.randint(0, 24, size=24), columns] = 1.0
-        diagnostics = dataset_diagnostics(
-            x, np.arange(len(x)) % 10, 10)
-        self.assertTrue(diagnostics["sequence_grid_likely"])
-        self.assertAlmostEqual(
-            diagnostics["column_one_hot_fraction"], 1.0)
-        transposed = dataset_diagnostics(
-            x.transpose(0, 1, 3, 2), np.arange(len(x)) % 10, 10)
-        self.assertTrue(transposed["sequence_grid_likely"])
-        self.assertAlmostEqual(
-            transposed["row_one_hot_fraction"], 1.0)
-
-        config = [
-            ("conv3x3", 0),
-            ("sep3x3", 0),
-            ("skip", 1),
-        ]
-        model = build_model_from_config(
-            config, 1, 10, 4, 32, 0.15,
-            input_height=24, input_width=24,
-            position_sensitive=True)
-        self.assertEqual(
-            sum(layer is not None for layer in model.downsamples), 1)
-        self.assertEqual(model.classifier.in_features, 64 * 12 * 12)
 
 
 if __name__ == "__main__":

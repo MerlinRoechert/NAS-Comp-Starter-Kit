@@ -126,8 +126,6 @@ def short_train(model, train_loader, valid_loader, device, updates):
 
 
 def candidate_ranges(metadata, diagnostics):
-    if diagnostics.get("sequence_grid_likely", False):
-        return 3, [2, 3, 4], [16, 24, 32]
     spatial = diagnostics["spatial_size"]
     classes = int(metadata["num_classes"])
     if classes <= 10 and spatial <= 512:
@@ -147,8 +145,6 @@ def calibrate_dataset(path, args, device):
     train_loader, valid_loader, _ = processor.process()
     nodes, cell_counts, channels = candidate_ranges(
         metadata, metadata["diagnostics"])
-    position_sensitive = bool(
-        metadata["diagnostics"].get("sequence_grid_likely", False))
     rng = random.Random(args.seed)
     records = []
     for index in range(args.candidates):
@@ -158,11 +154,7 @@ def calibrate_dataset(path, args, device):
         torch.manual_seed(args.seed + index)
         model = build_model_from_config(
             config, processor.train_x.shape[1], metadata["num_classes"],
-            n_cells, init_channels,
-            dropout_rate=0.15 if position_sensitive else 0.1,
-            input_height=processor.train_x.shape[2],
-            input_width=processor.train_x.shape[3],
-            position_sensitive=position_sensitive)
+            n_cells, init_channels, dropout_rate=0.1)
         params = compute_param_count(model)
         try:
             naswot = compute_naswot_score(

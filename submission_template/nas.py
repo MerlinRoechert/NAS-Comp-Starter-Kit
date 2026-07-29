@@ -62,15 +62,6 @@ class NAS:
             self.dropout_rate = float(bo_config["dropout"])
         self.proxy_weights = self._load_proxy_weights()
 
-    def _build_model(self, cell_config, n_cells, init_channels):
-        return build_model_from_config(
-            cell_config, self.in_channels, self.num_classes,
-            n_cells, init_channels, self.dropout_rate,
-            input_height=self.img_height,
-            input_width=self.img_width,
-            position_sensitive=self.sequence_grid_likely,
-        )
-
     def _time_left(self):
         try:
             return float(self.clock.check())
@@ -103,8 +94,6 @@ class NAS:
 
         # Estimate dataset complexity
         imbalance = diagnostics.get("class_imbalance_ratio", 1.0)
-        self.sequence_grid_likely = bool(
-            diagnostics.get("sequence_grid_likely", False))
         self.is_simple_task = (
             self.num_classes <= 10 and spatial_size <= 512 and
             n_datapoints < 25000
@@ -112,9 +101,7 @@ class NAS:
         self.is_large_spatial = (spatial_size > 1024)
 
         # Nodes per cell: 3-5 depending on complexity
-        if self.sequence_grid_likely:
-            self.n_nodes = 3
-        elif self.num_classes <= 10 and spatial_size <= 1024:
+        if self.num_classes <= 10 and spatial_size <= 1024:
             self.n_nodes = 3
         elif self.num_classes <= 50:
             self.n_nodes = 4
@@ -122,12 +109,7 @@ class NAS:
             self.n_nodes = 5
 
         # Search space sizing
-        if self.sequence_grid_likely:
-            self.cell_counts = [2, 3, 4]
-            self.init_channels_options = [16, 24, 32]
-            self.max_params = 3_000_000
-            self.dropout_rate = 0.15
-        elif self.is_simple_task:
+        if self.is_simple_task:
             self.cell_counts = [2, 3]
             self.init_channels_options = [16, 24]
             self.max_params = 750_000 if n_datapoints >= 5000 else 300_000
@@ -197,8 +179,10 @@ class NAS:
             init_channels = rng.choice(self.init_channels_options)
 
             try:
-                model = self._build_model(
-                    cell_config, n_cells, init_channels)
+                model = build_model_from_config(
+                    cell_config, self.in_channels, self.num_classes,
+                    n_cells, init_channels, self.dropout_rate
+                )
             except Exception:
                 continue
 
@@ -269,10 +253,6 @@ class NAS:
                 ideal = self.num_classes * 50_000
                 penalty = max(0, (c['params'] - ideal * 3) / (ideal * 10))
                 c['combined_score'] -= penalty
-            elif self.sequence_grid_likely:
-                excess = max(
-                    0.0, math.log10(max(1, c["params"])) - 6.0)
-                c["combined_score"] -= 0.20 * excess
 
         candidates.sort(key=lambda c: c['combined_score'], reverse=True)
 
@@ -309,7 +289,6 @@ class NAS:
                 break
         self.metadata['runner_up_configs'] = runner_ups
         self.metadata['dropout_rate'] = self.dropout_rate
-        self.metadata['position_sensitive'] = self.sequence_grid_likely
 
         print(f"\n  Selected architecture:")
         print(f"    Island: {best['island']}")
@@ -323,8 +302,10 @@ class NAS:
                   f"({', '.join(r['island'] for r in runner_ups)})")
 
         # Build the final model
-        model = self._build_model(
-            best['cell_config'], best['n_cells'], best['init_channels'])
+        model = build_model_from_config(
+            best['cell_config'], self.in_channels, self.num_classes,
+            best['n_cells'], best['init_channels'], self.dropout_rate
+        )
 
         # ==================================================================
         # PHASE 5: Short validation warm-up if time permits
@@ -360,9 +341,10 @@ class NAS:
         for candidate in finalists:
             if self._time_left() <= self._prediction_reserve() + 90:
                 break
-            model = self._build_model(
-                candidate["cell_config"], candidate["n_cells"],
-                candidate["init_channels"])
+            model = build_model_from_config(
+                candidate["cell_config"], self.in_channels, self.num_classes,
+                candidate["n_cells"], candidate["init_channels"],
+                self.dropout_rate)
             accuracy = self._short_train_accuracy(model, per_model)
             candidate["short_accuracy"] = accuracy
             if accuracy >= 0.0:
@@ -457,6 +439,12 @@ class NAS:
             ('skip', 0),
             ('conv3x3', 1),
         ]
-        model = self._build_model(
-            cell_config, n_cells=3, init_channels=32)
+        model = build_model_from_config(
+            cell_config,
+            self.in_channels,
+            self.num_classes,
+            n_cells=3,
+            init_channels=32,
+            dropout_rate=self.dropout_rate,
+        )
         return model

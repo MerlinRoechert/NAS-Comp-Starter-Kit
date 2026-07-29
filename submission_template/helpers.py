@@ -163,9 +163,7 @@ class CellNetwork(nn.Module):
     A network built from stacked cells with optional downsampling between stages.
     """
     def __init__(self, in_channels, num_classes, cell_config, n_cells=3,
-                 init_channels=32, channel_multiplier=2, dropout_rate=0.0,
-                 input_height=None, input_width=None,
-                 position_sensitive=False):
+                 init_channels=32, channel_multiplier=2, dropout_rate=0.0):
         """
         Args:
             in_channels: number of input image channels
@@ -178,7 +176,6 @@ class CellNetwork(nn.Module):
         """
         super().__init__()
         self.n_cells = n_cells
-        self.position_sensitive = position_sensitive
         n_nodes = len(cell_config)
 
         # Stem: initial convolution
@@ -195,19 +192,11 @@ class CellNetwork(nn.Module):
         c_in = init_channels
         c_out = init_channels
         downsample_interval = max(1, n_cells // 3)
-        downsample_count = 0
-        max_downsamples = 1 if position_sensitive else None
 
         for i in range(n_cells):
             # Downsample before certain cells (but not the first)
-            should_downsample = (
-                i > 0 and i % downsample_interval == 0
-                and (max_downsamples is None
-                     or downsample_count < max_downsamples)
-            )
-            if should_downsample:
+            if i > 0 and i % downsample_interval == 0:
                 c_out = min(c_out * channel_multiplier, 512)  # cap at 512
-                downsample_count += 1
                 self.downsamples.append(nn.Sequential(
                     nn.Conv2d(c_in, c_out, 1, stride=2, bias=False),
                     nn.BatchNorm2d(c_out),
@@ -221,22 +210,10 @@ class CellNetwork(nn.Module):
             self.cells.append(cell)
             c_in = c_out
 
-        if position_sensitive:
-            if input_height is None or input_width is None:
-                raise ValueError(
-                    "position-sensitive models require input dimensions")
-            final_height = int(input_height)
-            final_width = int(input_width)
-            for _ in range(downsample_count):
-                final_height = (final_height + 1) // 2
-                final_width = (final_width + 1) // 2
-            self.global_pool = nn.Identity()
-            classifier_features = c_out * final_height * final_width
-        else:
-            self.global_pool = nn.AdaptiveAvgPool2d(1)
-            classifier_features = c_out
+        # Global average pooling + classifier
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.dropout = nn.Dropout(p=dropout_rate) if dropout_rate > 0 else nn.Identity()
-        self.classifier = nn.Linear(classifier_features, num_classes)
+        self.classifier = nn.Linear(c_out, num_classes)
 
     def forward(self, x):
         x = self.stem(x)
@@ -269,10 +246,7 @@ def sample_cell_config(n_nodes, rng=None):
         config.append((op, input_idx))
     return config
 
-def build_model_from_config(
-        cell_config, in_channels, num_classes, n_cells, init_channels,
-        dropout_rate=0.0, input_height=None, input_width=None,
-        position_sensitive=False):
+def build_model_from_config(cell_config, in_channels, num_classes, n_cells, init_channels, dropout_rate=0.0):
     """Build a CellNetwork from a cell configuration."""
     return CellNetwork(
         in_channels=in_channels,
@@ -282,9 +256,6 @@ def build_model_from_config(
         init_channels=init_channels,
         channel_multiplier=2,
         dropout_rate=dropout_rate,
-        input_height=input_height,
-        input_width=input_width,
-        position_sensitive=position_sensitive,
     )
 
 # TRAINING-FREE PROXY SCORES

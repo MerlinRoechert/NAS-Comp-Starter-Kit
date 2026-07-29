@@ -295,11 +295,7 @@ class Trainer:
 
         incumbent_accuracy = self._best_accuracy
         dropout_rate = self.metadata.get('dropout_rate', 0.1)
-        position_sensitive = bool(
-            self.metadata.get('position_sensitive', False))
         in_channels = self.metadata['input_shape'][1]
-        input_height = self.metadata['input_shape'][2]
-        input_width = self.metadata['input_shape'][3]
         num_classes = self.metadata['num_classes']
 
         print(f"\n  === Runner-Up Challenge (incumbent: {100*incumbent_accuracy:.2f}%) ===")
@@ -317,10 +313,7 @@ class Trainer:
             try:
                 challenger = build_model_from_config(
                     runner['cell_config'], in_channels, num_classes,
-                    runner['n_cells'], runner['init_channels'], dropout_rate,
-                    input_height=input_height,
-                    input_width=input_width,
-                    position_sensitive=position_sensitive,
+                    runner['n_cells'], runner['init_channels'], dropout_rate
                 )
             except Exception:
                 print(f"    Failed to build runner-up, skipping")
