@@ -163,7 +163,8 @@ class CellNetwork(nn.Module):
     A network built from stacked cells with optional downsampling between stages.
     """
     def __init__(self, in_channels, num_classes, cell_config, n_cells=3,
-                 init_channels=32, channel_multiplier=2, dropout_rate=0.0):
+                 init_channels=32, channel_multiplier=2, dropout_rate=0.0,
+                 max_downsamples=None, spatial_pool_size=1):
         """
         Args:
             in_channels: number of input image channels
@@ -192,11 +193,15 @@ class CellNetwork(nn.Module):
         c_in = init_channels
         c_out = init_channels
         downsample_interval = max(1, n_cells // 3)
+        downsample_count = 0
 
         for i in range(n_cells):
             # Downsample before certain cells (but not the first)
-            if i > 0 and i % downsample_interval == 0:
+            if (i > 0 and i % downsample_interval == 0 and
+                    (max_downsamples is None or
+                     downsample_count < max_downsamples)):
                 c_out = min(c_out * channel_multiplier, 512)  # cap at 512
+                downsample_count += 1
                 self.downsamples.append(nn.Sequential(
                     nn.Conv2d(c_in, c_out, 1, stride=2, bias=False),
                     nn.BatchNorm2d(c_out),
@@ -210,10 +215,13 @@ class CellNetwork(nn.Module):
             self.cells.append(cell)
             c_in = c_out
 
-        # Global average pooling + classifier
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        # A small spatial grid is an optional positional specialist. The
+        # default remains ordinary global average pooling.
+        spatial_pool_size = max(1, int(spatial_pool_size))
+        self.global_pool = nn.AdaptiveAvgPool2d(spatial_pool_size)
         self.dropout = nn.Dropout(p=dropout_rate) if dropout_rate > 0 else nn.Identity()
-        self.classifier = nn.Linear(c_out, num_classes)
+        self.classifier = nn.Linear(
+            c_out * spatial_pool_size * spatial_pool_size, num_classes)
 
     def forward(self, x):
         x = self.stem(x)
@@ -246,7 +254,9 @@ def sample_cell_config(n_nodes, rng=None):
         config.append((op, input_idx))
     return config
 
-def build_model_from_config(cell_config, in_channels, num_classes, n_cells, init_channels, dropout_rate=0.0):
+def build_model_from_config(
+        cell_config, in_channels, num_classes, n_cells, init_channels,
+        dropout_rate=0.0, max_downsamples=None, spatial_pool_size=1):
     """Build a CellNetwork from a cell configuration."""
     return CellNetwork(
         in_channels=in_channels,
@@ -256,6 +266,8 @@ def build_model_from_config(cell_config, in_channels, num_classes, n_cells, init
         init_channels=init_channels,
         channel_multiplier=2,
         dropout_rate=dropout_rate,
+        max_downsamples=max_downsamples,
+        spatial_pool_size=spatial_pool_size,
     )
 
 # TRAINING-FREE PROXY SCORES

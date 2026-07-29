@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import time
 from torch.utils.data import DataLoader, Dataset as TorchDataset
 from torchvision.transforms import InterpolationMode
 
@@ -10,6 +11,45 @@ from helpers import (
     choose_batch_size,
     get_hardware_info,
 )
+
+_RUN_BUDGET_STATE = {
+    "datasets_seen": 0,
+    "global_24h_mode": False,
+}
+
+
+def allocate_dataset_budget(metadata, clock):
+    """Convert a possible 24-hour global clock into a safe per-dataset share.
+
+    The 2026 final evaluates three datasets in one process with 24 hours total.
+    Development metadata currently supplies much shorter per-dataset clocks.
+    A first observed budget above 18 hours unambiguously selects the global
+    regime; subsequent datasets share whatever global time remains.
+    """
+    try:
+        observed = float(metadata.get("time_remaining", clock.check()))
+    except Exception:
+        observed = float(metadata.get("time_remaining", 3600.0))
+    seen = int(_RUN_BUDGET_STATE["datasets_seen"])
+    if seen == 0 and observed >= 18.0 * 3600.0:
+        _RUN_BUDGET_STATE["global_24h_mode"] = True
+    expected = int(metadata.get("num_datasets", 3))
+    remaining_datasets = max(1, expected - seen)
+    if _RUN_BUDGET_STATE["global_24h_mode"]:
+        # Three percent covers orchestration/scoring outside the dataset clock.
+        allocated = 0.97 * observed / remaining_datasets
+        mode = "global-share"
+    else:
+        allocated = observed
+        mode = "metadata"
+    _RUN_BUDGET_STATE["datasets_seen"] = seen + 1
+    allocated = max(1.0, allocated)
+    metadata["global_time_remaining_at_start"] = observed
+    metadata["time_remaining"] = allocated
+    metadata["dataset_budget_seconds"] = allocated
+    metadata["dataset_deadline"] = time.perf_counter() + allocated
+    metadata["budget_mode"] = mode
+    return allocated
 
 
 def add_channel_dimension(images):
@@ -37,9 +77,30 @@ def dataset_diagnostics(images, labels, num_classes):
     imbalance = (float(counts.max()) / max(1.0, float(counts.min()))
                  if counts.size else 1.0)
     height, width = images.shape[-2:]
+    occupancy = 0.0
+    positional_one_hot_fraction = 0.0
+    if finite_values.size and sample.ndim == 4:
+        values, value_counts = np.unique(finite_values, return_counts=True)
+        background = values[int(np.argmax(value_counts))]
+        active = finite & (sample != background)
+        occupancy = float(active.mean())
+        column_counts = active.sum(axis=(1, 2))
+        row_counts = active.sum(axis=(1, 3))
+        positional_one_hot_fraction = max(
+            float(np.mean(column_counts == 1)),
+            float(np.mean(row_counts == 1)),
+        )
     # Few discrete values are a strong signal for boards, glyphs, masks and
     # other encoded inputs where spatial corruption is dangerous.
     encoded_likely = unique_values <= 32 or value_std == 0.0
+    sequence_grid_likely = (
+        encoded_likely
+        and images.shape[1] == 1
+        and unique_values <= 4
+        and 0.0 < occupancy <= 0.15
+        and positional_one_hot_fraction >= 0.80
+        and min(height, width) >= 8
+    )
     return {
         "n_train": int(len(images)),
         "channels": int(images.shape[1]),
@@ -54,6 +115,9 @@ def dataset_diagnostics(images, labels, num_classes):
         "nonfinite_fraction": float(1.0 - finite.mean()) if finite.size else 0.0,
         "class_imbalance_ratio": imbalance,
         "encoded_likely": bool(encoded_likely),
+        "occupancy": occupancy,
+        "positional_one_hot_fraction": positional_one_hot_fraction,
+        "sequence_grid_likely": bool(sequence_grid_likely),
     }
 
 
@@ -252,6 +316,13 @@ class DataProcessor:
             for value in label_values
         ]
         self.clock = clock
+        allocated = allocate_dataset_budget(self.metadata, self.clock)
+        print("  Budget allocation: mode={}, dataset={:.0f}s, "
+              "global-observed={:.0f}s".format(
+                  self.metadata["budget_mode"],
+                  allocated,
+                  self.metadata["global_time_remaining_at_start"],
+              ))
 
         self.seed = int(metadata.get("seed", 42))
         self.metadata["seed"] = self.seed
@@ -361,10 +432,14 @@ class DataProcessor:
         self.metadata["train_size"] = int(len(self.train_x))
         self.metadata["valid_size"] = int(len(self.valid_x))
         self.metadata["test_size"] = int(len(self.test_x))
-        print("  Diagnostics: encoded={}, unique~{}, imbalance={:.2f}, "
+        print("  Diagnostics: encoded={}, sequence_grid={}, unique~{}, "
+              "occupancy={:.2%}, positional_one_hot={:.2%}, imbalance={:.2f}, "
               "nonfinite={:.3%}, augmentation={}".format(
                   self.diagnostics["encoded_likely"],
+                  self.diagnostics["sequence_grid_likely"],
                   self.diagnostics["sample_unique_values"],
+                  self.diagnostics["occupancy"],
+                  self.diagnostics["positional_one_hot_fraction"],
                   self.diagnostics["class_imbalance_ratio"],
                   self.diagnostics["nonfinite_fraction"],
                   self.metadata["augmentation_policy"] or "none"))

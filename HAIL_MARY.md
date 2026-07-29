@@ -15,13 +15,26 @@ The competition implementation is `submission_template`.
 - non-finite values, constant channels, non-contiguous labels, and imbalance
   receive explicit handling;
 - capacity, dropout, class weighting, and early stopping adapt to diagnostics;
-- checkpoints are persisted under `predictions/`;
-- prediction reserves scale with test size, close challengers can be ensembled,
-  and the ensemble is disabled if measured prediction time becomes unsafe;
+- model construction, shuffling, augmentation, dropout, and challenger
+  repetitions use recorded deterministic seeds;
+- checkpoints are persisted under `predictions/`, and a valid incumbent exists
+  before the exploratory portfolio race starts;
+- up to eight diverse baseline challengers, an independent-seed repetition,
+  and an optional positional specialist receive successive-halving fidelity;
+- promoted challengers continue from their best checkpoint, while unused
+  budget is offered to the remaining candidates in validation order;
+- prediction reserves scale with test size; a two-model ensemble is used only
+  when averaged validation logits improve overall and remain robust on two
+  fixed stratified halves;
+- ensemble validation and prediction fall back to the single incumbent after
+  errors, unsafe timing, or accelerator-memory pressure;
 - training and prediction automatically reduce microbatch size after CUDA OOM.
 
-Every expensive feature checks the live clock. Below ten minutes, finalist
-training is skipped and the best proxy candidate is used.
+Every expensive feature checks the live clock. The scheduler reads the
+organizer-provided per-dataset clock, so the same submission adapts to short
+development limits and longer final-round limits without hardcoded dataset
+names or durations. A conservative prediction reserve is never allocated to
+challenger training.
 
 ## Cluster run order
 

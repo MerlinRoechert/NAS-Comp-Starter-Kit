@@ -4,6 +4,7 @@ a cell-based search space, diversity islands, and budget-aware candidate selecti
 """
 
 import json
+import hashlib
 import math
 import os
 import time
@@ -47,6 +48,8 @@ class NAS:
         self.img_height = self.input_shape[2]
         self.img_width = self.input_shape[3]
         self.time_remaining = metadata.get('time_remaining', 3600)
+        self.master_seed = int(metadata.get("seed", 42))
+        self.metadata["seed"] = self.master_seed
 
         # Device
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -62,11 +65,44 @@ class NAS:
             self.dropout_rate = float(bo_config["dropout"])
         self.proxy_weights = self._load_proxy_weights()
 
+    def _candidate_seed(self, cell_config, n_cells, init_channels,
+                        variant="baseline"):
+        payload = json.dumps({
+            "cell_config": cell_config,
+            "n_cells": int(n_cells),
+            "init_channels": int(init_channels),
+            "variant": variant,
+            "master_seed": self.master_seed,
+        }, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(payload.encode("utf-8")).digest()
+        return int.from_bytes(digest[:4], "big") & 0x7fffffff
+
+    def _reset_randomness(self, seed):
+        """Reset all state that affects initialization or short training."""
+        seed = int(seed)
+        random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        generator = getattr(self.train_loader, "generator", None)
+        if generator is not None:
+            generator.manual_seed(seed)
+        dataset_generator = getattr(
+            getattr(self.train_loader, "dataset", None), "generator", None)
+        if dataset_generator is not None:
+            dataset_generator.manual_seed(seed + 1)
+
     def _time_left(self):
         try:
-            return float(self.clock.check())
+            remaining = float(self.clock.check())
         except Exception:
-            return float(self.metadata.get("time_remaining", 3600.0))
+            remaining = float(
+                self.metadata.get("time_remaining", 3600.0))
+        deadline = self.metadata.get("dataset_deadline")
+        if deadline is not None:
+            remaining = min(
+                remaining, float(deadline) - time.perf_counter())
+        return remaining
 
     def _load_proxy_weights(self):
         """Use calibration output when it has been copied into the submission."""
@@ -177,8 +213,11 @@ class NAS:
             cell_config = sample_cell_config(self.n_nodes, rng)
             n_cells = rng.choice(self.cell_counts)
             init_channels = rng.choice(self.init_channels_options)
+            candidate_seed = self._candidate_seed(
+                cell_config, n_cells, init_channels)
 
             try:
+                self._reset_randomness(candidate_seed)
                 model = build_model_from_config(
                     cell_config, self.in_channels, self.num_classes,
                     n_cells, init_channels, self.dropout_rate
@@ -214,6 +253,8 @@ class NAS:
                 'synflow': synflow_score,
                 'params': param_count,
                 'island': island,
+                'seed': candidate_seed,
+                'model_kwargs': {},
                 'descriptor': architecture_descriptor(
                     cell_config, n_cells, init_channels, param_count),
             })
@@ -257,7 +298,13 @@ class NAS:
         candidates.sort(key=lambda c: c['combined_score'], reverse=True)
 
         print("\n  Phase 3: Measured diversity selection...")
-        finalist_count = min(5 if self._time_left() > 3600 else 3, len(candidates))
+        if self._time_left() > 3600:
+            desired_finalists = 8
+        elif self._time_left() > 1200:
+            desired_finalists = 5
+        else:
+            desired_finalists = 3
+        finalist_count = min(desired_finalists, len(candidates))
         champions = select_diverse_candidates(candidates, finalist_count)
         diversity = diversity_summary(champions)
         self.metadata["diversity"] = diversity
@@ -269,7 +316,8 @@ class NAS:
         # champion whenever the live budget can support it.
         best = self._successive_halving(champions)
 
-        # Save runner-up configs in metadata so Trainer can try them if time permits
+        # Save a broad portfolio. Trainer progressively allocates fidelity, so
+        # these candidates do not all receive full training automatically.
         runner_ups = []
         ranked_champions = sorted(
             champions,
@@ -284,24 +332,100 @@ class NAS:
                 'init_channels': champ['init_channels'],
                 'params': champ['params'],
                 'island': champ['island'],
+                'seed': champ['seed'],
+                'model_kwargs': dict(champ.get('model_kwargs', {})),
+                'proxy_score': champ['combined_score'],
+                'short_accuracy': champ.get('short_accuracy', -1.0),
             })
-            if len(runner_ups) == 2:
+            if len(runner_ups) == 7:
                 break
+
+        # A second initialization of the selected architecture is often a more
+        # useful variance hedge than another similar architecture.
+        replica = {
+            'cell_config': best['cell_config'],
+            'n_cells': best['n_cells'],
+            'init_channels': best['init_channels'],
+            'params': best['params'],
+            'island': 'seed-repeat',
+            'seed': (best['seed'] + 1_000_003) & 0x7fffffff,
+            'model_kwargs': {},
+            'proxy_score': best['combined_score'],
+            'short_accuracy': best.get('short_accuracy', -1.0),
+        }
+        runner_ups.append(replica)
+
+        # Sparse positional inputs get one extra specialist, never a replacement
+        # for the baseline portfolio. Its initial fidelity is deliberately small.
+        if self.metadata.get("diagnostics", {}).get(
+                "sequence_grid_likely", False):
+            specialist_config = [
+                ('conv3x3', 0),
+                ('sep3x3', 0),
+                ('skip', 1),
+            ]
+            specialist_cells = 4
+            specialist_channels = 32
+            specialist_kwargs = {
+                "max_downsamples": 1,
+                "spatial_pool_size": 3,
+            }
+            specialist_seed = self._candidate_seed(
+                specialist_config, specialist_cells, specialist_channels,
+                variant="positional-specialist")
+            try:
+                self._reset_randomness(specialist_seed)
+                specialist_model = build_model_from_config(
+                    specialist_config, self.in_channels, self.num_classes,
+                    specialist_cells, specialist_channels, 0.15,
+                    **specialist_kwargs)
+                specialist_params = compute_param_count(specialist_model)
+                specialist_model.cpu()
+                del specialist_model
+                runner_ups.append({
+                    'cell_config': specialist_config,
+                    'n_cells': specialist_cells,
+                    'init_channels': specialist_channels,
+                    'params': specialist_params,
+                    'island': 'positional-specialist',
+                    'seed': specialist_seed,
+                    'model_kwargs': specialist_kwargs,
+                    'dropout_rate': 0.15,
+                    'proxy_score': -1.0,
+                    'short_accuracy': -1.0,
+                    'specialist': True,
+                })
+                print("  Added capped positional specialist challenger "
+                      f"({specialist_params:,} params)")
+            except Exception as error:
+                print(f"  Positional specialist unavailable: {error}")
+
         self.metadata['runner_up_configs'] = runner_ups
         self.metadata['dropout_rate'] = self.dropout_rate
+        self.metadata['primary_candidate'] = {
+            'cell_config': best['cell_config'],
+            'n_cells': best['n_cells'],
+            'init_channels': best['init_channels'],
+            'params': best['params'],
+            'island': best['island'],
+            'seed': best['seed'],
+            'model_kwargs': {},
+        }
 
         print(f"\n  Selected architecture:")
         print(f"    Island: {best['island']}")
         print(f"    Cells: {best['n_cells']}, Init channels: {best['init_channels']}")
         print(f"    Params: {best['params']:,}")
+        print(f"    Seed: {best['seed']}")
         print(f"    NASWOT (norm): {best['naswot_norm']:.4f}")
         print(f"    SynFlow (norm): {best['synflow_norm']:.4f}")
         print(f"    Combined score: {best['combined_score']:.4f}")
         if runner_ups:
-            print(f"    Runner-ups saved: {len(runner_ups)} "
-                  f"({', '.join(r['island'] for r in runner_ups)})")
+            print(f"    Portfolio challengers saved: {len(runner_ups)} "
+                  f"({', '.join('{}@{}'.format(r['island'], r['seed']) for r in runner_ups)})")
 
         # Build the final model
+        self._reset_randomness(best['seed'])
         model = build_model_from_config(
             best['cell_config'], self.in_channels, self.num_classes,
             best['n_cells'], best['init_channels'], self.dropout_rate
@@ -341,6 +465,7 @@ class NAS:
         for candidate in finalists:
             if self._time_left() <= self._prediction_reserve() + 90:
                 break
+            self._reset_randomness(candidate["seed"])
             model = build_model_from_config(
                 candidate["cell_config"], self.in_channels, self.num_classes,
                 candidate["n_cells"], candidate["init_channels"],
@@ -439,6 +564,19 @@ class NAS:
             ('skip', 0),
             ('conv3x3', 1),
         ]
+        fallback_seed = self._candidate_seed(
+            cell_config, 3, 32, variant="fallback")
+        self._reset_randomness(fallback_seed)
+        self.metadata["primary_candidate"] = {
+            "cell_config": cell_config,
+            "n_cells": 3,
+            "init_channels": 32,
+            "params": -1,
+            "island": "fallback",
+            "seed": fallback_seed,
+            "model_kwargs": {},
+        }
+        self.metadata["runner_up_configs"] = []
         model = build_model_from_config(
             cell_config,
             self.in_channels,
