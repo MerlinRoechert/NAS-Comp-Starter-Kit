@@ -2,7 +2,11 @@
 
 This directory is development tooling and is not included in the competition
 submission. It runs 100 low-budget pipeline evaluations, beginning with a
-25-configuration Sobol initial design. By default, SMAC maximizes the mean
+25-configuration Sobol initial design. The targeted space contains only four
+transferable training controls: learning-rate multiplier, weight-decay
+multiplier, label smoothing, and batch size. Architecture selection,
+augmentation, specialists, portfolio racing, and ensembles remain adaptive
+and unchanged. By default, SMAC maximizes the mean
 validation-set adjusted score across the selected development datasets using
 the same benchmark normalization as `evaluation/score.py`. Test labels are
 never read.
@@ -54,6 +58,38 @@ is stored below the same output directory. Run on multiple representative
 development datasets to reduce specialization to one visible dataset. Because
 the budget is per dataset, the approximate compute consumed is
 `trials * datasets * budget`.
+
+The learning-rate and weight-decay values are multipliers around the incumbent
+dataset-adaptive defaults. Each trial prints the resolved per-dataset values as
+`effective_training_configs`. The resulting incumbent is an experiment
+candidate only: BO never edits `submission_template`.
+
+## Copy-paste LUH launch for `nhkbkpkm`
+
+Install the development-only dependencies once from a login node, if needed:
+
+```bash
+cd /bigwork/nhkbkpkm/NAS-Comp-Starter-Kit
+source venv/bin/activate
+python -m pip install -r bo/requirements.txt
+```
+
+Then launch the time-constrained study:
+
+```bash
+cd /bigwork/nhkbkpkm/NAS-Comp-Starter-Kit
+bash bo/launch_luh_bo_nhkbkpkm.sh
+```
+
+This teammate-specific launcher requests 8 GPU workers and runs 32 evaluations:
+8 Sobol configurations followed by 24 SMAC-guided configurations. With five
+datasets and 15 minutes per dataset, this is about five hours of ideal
+optimization wall time in four waves, excluding queue and startup overhead.
+The generic command-line interface still defaults to the larger 100-trial,
+25-worker study.
+
+The launcher prints a timestamped run directory. This prevents an older smoke
+test or the former 10-parameter study from being resumed accidentally.
 
 ## Cluster execution
 

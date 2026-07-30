@@ -43,10 +43,8 @@ class DiverseConfigSelector(ConfigSelector):
     """Reject near-duplicates among recently issued parallel configurations."""
 
     _NUMERIC_RANGES = {
-        "learning_rate": (0.005, 0.15, True),
-        "weight_decay": (1e-5, 5e-3, True),
-        "dropout": (0.0, 0.4, False),
-        "augmentation_probability": (0.0, 0.3, False),
+        "learning_rate_multiplier": (0.5, 2.0, True),
+        "weight_decay_multiplier": (0.25, 4.0, True),
     }
 
     def __init__(
@@ -103,45 +101,54 @@ class DiverseConfigSelector(ConfigSelector):
 
 def configuration_space(seed: int) -> ConfigurationSpace:
     cs = ConfigurationSpace(seed=seed)
-    learning_rate = Float(
-        "learning_rate", bounds=(0.005, 0.15), default=0.05, log=True)
-    weight_decay = Float(
-        "weight_decay", bounds=(1e-5, 5e-3), default=5e-4, log=True)
-    init_channels = Categorical(
-        "init_channels", [16, 24, 32, 48, 64], default=32)
-    n_cells = Categorical("n_cells", [2, 3, 4, 5, 6], default=3)
-    dropout = Float("dropout", bounds=(0.0, 0.4), default=0.1)
+    learning_rate_multiplier = Float(
+        "learning_rate_multiplier",
+        bounds=(0.5, 2.0),
+        default=1.0,
+        log=True,
+    )
+    weight_decay_multiplier = Float(
+        "weight_decay_multiplier",
+        bounds=(0.25, 4.0),
+        default=1.0,
+        log=True,
+    )
     label_smoothing = Categorical(
         "label_smoothing", [0.0, 0.025, 0.05, 0.1], default=0.1)
-    augmentation_mode = Categorical(
-        "augmentation_mode",
-        ["none", "noise", "occlusion", "noise+occlusion"],
-        default="noise+occlusion",
-    )
-    augmentation_probability = Float(
-        "augmentation_probability", bounds=(0.0, 0.3), default=0.3)
     batch_size = Categorical("batch_size", [16, 32, 64], default=64)
-    class_weighting = Categorical(
-        "class_weighting",
-        ["none", "inverse_sqrt", "inverse"],
-        default="inverse",
-    )
     cs.add([
-        learning_rate,
-        weight_decay,
-        init_channels,
-        n_cells,
-        dropout,
+        learning_rate_multiplier,
+        weight_decay_multiplier,
         label_smoothing,
-        augmentation_mode,
-        augmentation_probability,
         batch_size,
-        class_weighting,
     ])
-    # A probability has no effect when augmentation is disabled.
-    # This remains unconditional because it is active for three of the four
-    # policies. The target ignores it when augmentation_mode is "none".
     return cs
+
+
+def effective_training_config(config: dict, metadata: dict) -> dict:
+    """Resolve transferable multipliers against the incumbent's adaptations."""
+    batch_size = int(config["batch_size"])
+    base_lr = min(0.2, max(0.01, 0.05 * batch_size / 128.0))
+
+    input_shape = metadata.get("input_shape", [50_000])
+    num_classes = int(metadata.get("num_classes", 10))
+    spatial_size = 1
+    if len(input_shape) >= 4:
+        spatial_size = int(input_shape[2]) * int(input_shape[3])
+    base_weight_decay = (
+        2e-3 if num_classes <= 10 and spatial_size <= 512 else 5e-4
+    )
+
+    return {
+        "learning_rate": (
+            base_lr * float(config["learning_rate_multiplier"])
+        ),
+        "weight_decay": (
+            base_weight_decay * float(config["weight_decay_multiplier"])
+        ),
+        "label_smoothing": float(config["label_smoothing"]),
+        "batch_size": batch_size,
+    }
 
 
 def _load_submission(submission_dir: Path):
@@ -197,6 +204,7 @@ class PipelineTarget:
         config_dict = dict(config)
         accuracies: list[float] = []
         adjusted_scores: list[float] = []
+        effective_configs: list[dict] = []
         DataProcessor, NAS, Trainer = _load_submission(
             Path(self.submission_dir))
 
@@ -214,9 +222,15 @@ class PipelineTarget:
                 train_x, train_y, valid_x, valid_y, test_x, metadata = data
                 clock = BudgetClock(self.budget_seconds)
                 metadata["time_remaining"] = self.budget_seconds
-                metadata["bo_config"] = config_dict
+                effective_config = effective_training_config(
+                    config_dict, metadata)
+                metadata["bo_config"] = effective_config
                 metadata["seed"] = trial_seed
                 metadata["disable_checkpoint"] = True
+                effective_configs.append({
+                    "dataset": dataset_dir.name,
+                    **effective_config,
+                })
 
                 processor = DataProcessor(
                     train_x, train_y, valid_x, valid_y, test_x, metadata, clock)
@@ -257,6 +271,7 @@ class PipelineTarget:
             cost = 1.0 - float(np.mean(accuracies))
         print(json.dumps({
             "bo_config": config_dict,
+            "effective_training_configs": effective_configs,
             "accuracies": accuracies,
             "adjusted_scores": adjusted_scores,
             "cost": cost,
@@ -320,7 +335,10 @@ def parse_args() -> argparse.Namespace:
         "--luh-slurm", action="store_true",
         help="Create LUH Slurm workers dynamically with dask-jobqueue.")
     parser.add_argument("--slurm-partition", default="ai")
-    parser.add_argument("--slurm-gpu", default="a100")
+    parser.add_argument(
+        "--slurm-gpu",
+        default="a100",
+        help="GPU type (for gpu:TYPE:1); pass an empty value for --gres=gpu:1.")
     parser.add_argument("--slurm-cpus", type=int, default=2)
     parser.add_argument("--slurm-memory", default="16GiB")
     parser.add_argument("--slurm-walltime", default="03:00:00")
@@ -374,6 +392,10 @@ def main() -> None:
                 "module load Miniforge3",
                 "conda activate {}".format(args.slurm_conda_env),
             ]
+        gpu_directive = (
+            "--gres=gpu:{}:1".format(args.slurm_gpu)
+            if args.slurm_gpu else "--gres=gpu:1"
+        )
         cluster = SLURMCluster(
             queue=args.slurm_partition,
             cores=args.slurm_cpus,
@@ -384,7 +406,7 @@ def main() -> None:
             job_extra_directives=[
                 "--nodes=1",
                 "--ntasks=1",
-                "--gres=gpu:{}:1".format(args.slurm_gpu),
+                gpu_directive,
                 "--output={}/%x_%j.out".format(logs),
                 "--error={}/%x_%j.err".format(logs),
             ],

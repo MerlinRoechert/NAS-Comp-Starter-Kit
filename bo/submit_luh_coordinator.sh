@@ -44,21 +44,23 @@ else
     worker_environment_args=(--slurm-conda-env "${NAS_BO_CONDA_ENV}")
 fi
 cd "${NAS_BO_REPOSITORY}"
-mkdir -p bo/output
+output_directory="${NAS_BO_OUTPUT:-bo/output}"
+mkdir -p "${output_directory}"
 
 read -r -a dataset_names <<< "${NAS_BO_DATASETS}"
 
 python -m bo.run_smac \
-    --trials 100 \
-    --initial-sobol 25 \
-    --workers 25 \
+    --trials "${NAS_BO_TRIALS:-100}" \
+    --initial-sobol "${NAS_BO_INITIAL_SOBOL:-25}" \
+    --workers "${NAS_BO_WORKERS:-25}" \
     --budget-minutes "${NAS_BO_BUDGET_MINUTES:-15}" \
+    --output "${output_directory}" \
     --datasets-root "${NAS_BO_DATASETS_ROOT}" \
     --datasets "${dataset_names[@]}" \
     --luh-slurm \
-    --slurm-partition ai \
-    --slurm-gpu a100 \
-    --slurm-cpus 2 \
-    --slurm-memory 16GiB \
-    --slurm-walltime 08:00:00 \
+    --slurm-partition "${NAS_BO_SLURM_PARTITION:-ai}" \
+    --slurm-gpu "${NAS_BO_SLURM_GPU:-a100}" \
+    --slurm-cpus "${NAS_BO_SLURM_CPUS:-4}" \
+    --slurm-memory "${NAS_BO_SLURM_MEMORY:-32GiB}" \
+    --slurm-walltime "${NAS_BO_SLURM_WALLTIME:-03:00:00}" \
     "${worker_environment_args[@]}"
