@@ -72,6 +72,7 @@ class Trainer:
         self._best_accuracy = -1.0
         self._epochs_without_improvement = 0
         self._ensemble_models = []
+        self._ensemble_weights = [1.0]
         self._model_records = []
         self._incumbent_model = self.model
         if hasattr(torch.backends, "cudnn"):
@@ -292,6 +293,7 @@ class Trainer:
         except Exception as error:
             print("  Ensemble validation failed safely: {}".format(error))
             self._ensemble_models = []
+            self._ensemble_weights = [1.0]
             self.model = self._incumbent_model
             if self._best_state is not None:
                 self.model.load_state_dict(self._best_state)
@@ -703,8 +705,9 @@ class Trainer:
         return first, ~first
 
     def _select_validated_ensemble(self, reserve):
-        """Use two models only when averaged validation logits robustly improve."""
+        """Select a small, robustly validated weighted ensemble."""
         self._ensemble_models = []
+        self._ensemble_weights = [1.0]
         records = sorted(
             [record for record in self._model_records
              if record.get("accuracy", -1.0) >= 0],
@@ -726,11 +729,36 @@ class Trainer:
             for mask in masks if bool(mask.any())
         ]
 
+        # Prefer one strong representative per island, then fill remaining
+        # slots by validation accuracy. A five-point cutoff still includes the
+        # complementary Gutenberg specialist/CNN pairing observed during
+        # development.
+        eligible = [
+            record for record in records[1:]
+            if record["accuracy"] >= winner["accuracy"] - 0.05
+        ]
+        shortlist = []
+        used_islands = {winner.get("island")}
+        for record in eligible:
+            island = record.get("island")
+            if island not in used_islands:
+                shortlist.append(record)
+                used_islands.add(island)
+            if len(shortlist) == 4:
+                break
+        for record in eligible:
+            if len(shortlist) == 4:
+                break
+            if all(record is not selected for selected in shortlist):
+                shortlist.append(record)
+
         best_partner = None
+        best_weight = None
         best_accuracy = winner_full
-        # Limit selection pressure: compare the winner with at most three
-        # strong, distinct alternatives and keep at most one.
-        for partner in records[1:4]:
+        best_halves = winner_halves
+        cached_logits = {}
+        incumbent_weights = (0.8, 0.7, 0.6, 0.5)
+        for partner in shortlist:
             if self._time_left() <= reserve + 45:
                 break
             partner_result = self._validation_logits(
@@ -741,22 +769,35 @@ class Trainer:
             if (len(partner_targets) != len(targets) or
                     not torch.equal(partner_targets, targets)):
                 continue
-            predictions = (
-                (winner_logits + partner_logits) * 0.5).argmax(1)
-            full_accuracy = float(
-                (predictions == targets).float().mean())
-            half_accuracies = [
-                float((predictions[mask] == targets[mask]).float().mean())
-                for mask in masks if bool(mask.any())
-            ]
-            robust_halves = all(
-                ensemble_half >= winner_half - 0.001
-                for ensemble_half, winner_half
-                in zip(half_accuracies, winner_halves))
-            if (full_accuracy >= winner_full + 0.0015 and
-                    robust_halves and full_accuracy > best_accuracy):
-                best_accuracy = full_accuracy
-                best_partner = partner
+            # Identical predictions provide no useful robustness diversity.
+            disagreement = float(
+                (partner_logits.argmax(1) != winner_predictions)
+                .float().mean())
+            if disagreement < 0.001:
+                continue
+            cached_logits[id(partner)] = partner_logits
+            for incumbent_weight in incumbent_weights:
+                combined = (
+                    incumbent_weight * winner_logits +
+                    (1.0 - incumbent_weight) * partner_logits
+                )
+                predictions = combined.argmax(1)
+                full_accuracy = float(
+                    (predictions == targets).float().mean())
+                half_accuracies = [
+                    float((predictions[mask] == targets[mask]).float().mean())
+                    for mask in masks if bool(mask.any())
+                ]
+                robust_halves = all(
+                    ensemble_half >= winner_half - 0.0005
+                    for ensemble_half, winner_half
+                    in zip(half_accuracies, winner_halves))
+                if (full_accuracy >= winner_full + 0.0015 and
+                        robust_halves and full_accuracy > best_accuracy):
+                    best_accuracy = full_accuracy
+                    best_halves = half_accuracies
+                    best_partner = partner
+                    best_weight = incumbent_weight
 
         self.model = winner["model"].to(self.device)
         self._incumbent_model = self.model
@@ -764,11 +805,61 @@ class Trainer:
         if best_partner is not None:
             best_partner["model"].eval()
             self._ensemble_models = [best_partner["model"]]
-            print("  Validated ensemble: {:.2f}% -> {:.2f}% with {}".format(
-                100.0 * winner_full,
-                100.0 * best_accuracy,
-                best_partner["island"],
-            ))
+            self._ensemble_weights = [
+                best_weight, 1.0 - best_weight]
+
+            # A third model gets one deliberately fixed, incumbent-heavy test.
+            # It must improve on the accepted pair and pass the same split gate.
+            third_record = None
+            third_accuracy = best_accuracy
+            for candidate in shortlist:
+                if (candidate is best_partner or
+                        id(candidate) not in cached_logits):
+                    continue
+                if self._time_left() <= reserve + 30:
+                    break
+                combined = (
+                    0.5 * winner_logits +
+                    0.3 * cached_logits[id(best_partner)] +
+                    0.2 * cached_logits[id(candidate)]
+                )
+                predictions = combined.argmax(1)
+                full_accuracy = float(
+                    (predictions == targets).float().mean())
+                half_accuracies = [
+                    float((predictions[mask] == targets[mask]).float().mean())
+                    for mask in masks if bool(mask.any())
+                ]
+                robust_halves = all(
+                    ensemble_half >= pair_half - 0.0005
+                    for ensemble_half, pair_half
+                    in zip(half_accuracies, best_halves))
+                if (full_accuracy >= best_accuracy + 0.0015 and
+                        robust_halves and full_accuracy > third_accuracy):
+                    third_record = candidate
+                    third_accuracy = full_accuracy
+
+            if third_record is not None:
+                third_record["model"].eval()
+                self._ensemble_models.append(third_record["model"])
+                self._ensemble_weights = [0.5, 0.3, 0.2]
+                print(
+                    "  Validated 3-model ensemble: {:.2f}% -> {:.2f}% "
+                    "with {} + {}".format(
+                        100.0 * winner_full,
+                        100.0 * third_accuracy,
+                        best_partner["island"],
+                        third_record["island"],
+                    ))
+            else:
+                print("  Validated weighted ensemble: {:.2f}% -> {:.2f}% "
+                      "with {} ({:.0f}/{:.0f})".format(
+                          100.0 * winner_full,
+                          100.0 * best_accuracy,
+                          best_partner["island"],
+                          100.0 * best_weight,
+                          100.0 * (1.0 - best_weight),
+                      ))
         else:
             print("  Ensemble rejected: no robust validation improvement")
 
@@ -793,6 +884,9 @@ class Trainer:
         self.model.eval()
         predictions = []
         models = [self.model] + list(self._ensemble_models)
+        weights = list(self._ensemble_weights)
+        if len(weights) != len(models):
+            weights = [1.0 / len(models)] * len(models)
         try:
             for candidate in models:
                 candidate.to(self.device)
@@ -804,7 +898,9 @@ class Trainer:
             for extra in self._ensemble_models:
                 extra.cpu()
             self._ensemble_models = []
+            self._ensemble_weights = [1.0]
             models = [self.model]
+            weights = [1.0]
             self.model.to(self.device)
             self.model.eval()
             if torch.cuda.is_available():
@@ -821,14 +917,15 @@ class Trainer:
                     with torch.cuda.amp.autocast(enabled=self._use_amp):
                         logits = [self._logits(candidate(data))
                                   for candidate in models]
-                        output = sum(logits) / float(len(logits))
+                        output = self._weighted_logits(logits, weights)
                 except RuntimeError as error:
                     if ("out of memory" not in str(error).lower() or
                             len(data) <= 1):
                         raise
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    output = self._predict_in_chunks(models, data.cpu())
+                    output = self._predict_in_chunks(
+                        models, weights, data.cpu())
                 predicted_indices = output.argmax(1).cpu().tolist()
                 label_values = self.metadata.get("label_values")
                 if label_values is None:
@@ -846,27 +943,34 @@ class Trainer:
                             0.0, self.metadata.get("test_size", processed) /
                             float(processed) - 1.0) + 30.0):
                     models = models[:1]
+                    weights = [1.0]
                     print("  Prediction safety: disabling ensemble")
         return predictions
 
-    def _predict_in_chunks(self, models, cpu_data):
+    @staticmethod
+    def _weighted_logits(logits, weights):
+        return sum(
+            weight * output for weight, output in zip(weights, logits))
+
+    def _predict_in_chunks(self, models, weights, cpu_data):
         """Recursively reduce prediction microbatch size after an OOM."""
         if len(cpu_data) <= 1:
             data = cpu_data.to(self.device)
-            return sum(self._logits(model(data)) for model in models) / float(
-                len(models))
+            logits = [self._logits(model(data)) for model in models]
+            return self._weighted_logits(logits, weights)
         midpoint = len(cpu_data) // 2
         outputs = []
         for chunk in (cpu_data[:midpoint], cpu_data[midpoint:]):
             try:
                 data = chunk.to(self.device)
                 with torch.cuda.amp.autocast(enabled=self._use_amp):
-                    output = sum(self._logits(model(data)) for model in models)
-                    outputs.append(output / float(len(models)))
+                    logits = [self._logits(model(data)) for model in models]
+                    outputs.append(self._weighted_logits(logits, weights))
             except RuntimeError as error:
                 if "out of memory" not in str(error).lower():
                     raise
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                outputs.append(self._predict_in_chunks(models, chunk))
+                outputs.append(self._predict_in_chunks(
+                    models, weights, chunk))
         return torch.cat(outputs, dim=0)

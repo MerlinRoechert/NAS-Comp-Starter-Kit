@@ -144,6 +144,14 @@ class HailMaryTests(unittest.TestCase):
         self.assertTrue(bool(first.any()))
         self.assertTrue(bool(second.any()))
 
+    def test_weighted_logits(self):
+        first = torch.tensor([[4.0, 0.0], [0.0, 2.0]])
+        second = torch.tensor([[0.0, 2.0], [4.0, 0.0]])
+        combined = Trainer._weighted_logits(
+            [first, second], [0.75, 0.25])
+        self.assertTrue(torch.allclose(
+            combined, 0.75 * first + 0.25 * second))
+
 
 if __name__ == "__main__":
     unittest.main()
